@@ -1192,8 +1192,10 @@ fn parse_codex_reader<R: BufRead>(
                     } else {
                         // A timestamp-less, last-only row used to have no key,
                         // so a live rollout and its `.jsonl.zst` copy were both
-                        // counted. The logical rollout plus event ordinal stays
-                        // stable even though each copy has a different mtime.
+                        // counted. The logical rollout, event ordinal, model,
+                        // and emitted usage stay stable across identical copies,
+                        // while the usage fingerprint keeps a rewritten live
+                        // row distinct from an older archive at the same ordinal.
                         // This only stabilizes identity: after the plain file is
                         // removed, the archive can still move the row's day to
                         // its newer mtime because the original mtime is absent.
@@ -1533,12 +1535,18 @@ fn set_codex_fallback_dedup_key(
 ) {
     if message.dedup_key.is_none() {
         message.dedup_key = Some(format!(
-            "codex:usage-fallback:{}:{}:{}:{}:{}",
+            "codex:usage-fallback:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             identity.rollout_id.len(),
             identity.rollout_id,
             identity.usage_event_ordinal,
             model.len(),
-            model
+            model,
+            message.tokens.input,
+            message.tokens.output,
+            message.tokens.cache_read,
+            message.tokens.cache_write,
+            message.tokens.cache_write_1h,
+            message.tokens.reasoning
         ));
     }
 }
@@ -4421,9 +4429,9 @@ mod tests {
         let content = concat!(
             r#"{"type":"session_meta","payload":{"id":"logical-rollout"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":3,"output_tokens":5,"reasoning_output_tokens":2}}}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":3,"output_tokens":5,"reasoning_output_tokens":2}}}}"#,
             "\n",
             r#"{"type":"metadata","model":"gpt-5"}"#,
             "\n"
@@ -4449,20 +4457,73 @@ mod tests {
         assert_eq!(
             plain_keys,
             vec![
-                "codex:usage-fallback:15:logical-rollout:0:5:gpt-5",
-                "codex:usage-fallback:15:logical-rollout:1:5:gpt-5",
+                "codex:usage-fallback:15:logical-rollout:0:5:gpt-5:7:3:3:0:0:2",
+                "codex:usage-fallback:15:logical-rollout:1:5:gpt-5:7:3:3:0:0:2",
             ]
         );
     }
 
     #[test]
+    fn fallback_usage_dedup_key_covers_every_emitted_token_bucket() {
+        let identity = CodexFallbackDedupIdentity {
+            rollout_id: "all-buckets".to_string(),
+            usage_event_ordinal: 0,
+        };
+        let key_for = |tokens: TokenBreakdown| {
+            let mut message =
+                UnifiedMessage::new("codex", "gpt-5", "openai", "all-buckets", 0, tokens, 0.0);
+            set_codex_fallback_dedup_key(&mut message, "gpt-5", &identity);
+            message.dedup_key.unwrap()
+        };
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(key_for(TokenBreakdown::default()));
+        for tokens in [
+            TokenBreakdown {
+                input: 1,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                output: 1,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                cache_read: 1,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                cache_write: 1,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                cache_write_1h: 1,
+                ..Default::default()
+            },
+            TokenBreakdown {
+                reasoning: 1,
+                ..Default::default()
+            },
+        ] {
+            keys.insert(key_for(tokens));
+        }
+        assert_eq!(
+            keys.len(),
+            7,
+            "every emitted token bucket must affect identity"
+        );
+    }
+
+    #[test]
     fn fallback_usage_ordinal_survives_incremental_resume() {
-        let event = concat!(
+        let first_event = concat!(
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
             "\n"
         );
+        let second_event = concat!(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":11,"output_tokens":3}}}}"#,
+            "\n"
+        );
         let mut file = create_test_file(&format!(
-            "{}\n{}\n{event}",
+            "{}\n{}\n{first_event}",
             r#"{"type":"session_meta","payload":{"id":"incremental-rollout"}}"#,
             r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
         ));
@@ -4471,10 +4532,13 @@ mod tests {
         assert_eq!(initial.state.usage_event_ordinal, 1);
         assert_eq!(
             initial.messages[0].dedup_key.as_deref(),
-            Some("codex:usage-fallback:19:incremental-rollout:0:5:gpt-5")
+            Some("codex:usage-fallback:19:incremental-rollout:0:5:gpt-5:10:2:0:0:0:0")
         );
+        let initial_key = initial.messages[0].dedup_key.clone().unwrap();
 
-        file.as_file_mut().write_all(event.as_bytes()).unwrap();
+        file.as_file_mut()
+            .write_all(second_event.as_bytes())
+            .unwrap();
         file.as_file_mut().flush().unwrap();
         let appended =
             parse_codex_file_incremental(file.path(), initial.consumed_offset, initial.state);
@@ -4483,17 +4547,29 @@ mod tests {
         assert_eq!(appended.state.usage_event_ordinal, 2);
         assert_eq!(
             appended.messages[0].dedup_key.as_deref(),
-            Some("codex:usage-fallback:19:incremental-rollout:1:5:gpt-5")
+            Some("codex:usage-fallback:19:incremental-rollout:1:5:gpt-5:11:3:0:0:0:0")
         );
+        let resumed_keys = [initial_key, appended.messages[0].dedup_key.clone().unwrap()];
+        let full_keys = parse_codex_file(file.path())
+            .into_iter()
+            .map(|message| message.dedup_key.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(full_keys, resumed_keys);
     }
 
     #[test]
-    fn headless_fallback_usage_gets_the_same_copy_stable_identity() {
+    fn headless_fallback_usage_identity_is_copy_stable_and_content_sensitive() {
         let dir = TempDir::new().unwrap();
         let content = concat!(
             r#"{"type":"session_meta","payload":{"id":"headless-rollout"}}"#,
             "\n",
             r#"{"type":"turn.completed","model":"gpt-4o","usage":{"input_tokens":12,"output_tokens":3}}"#,
+            "\n"
+        );
+        let diverged = concat!(
+            r#"{"type":"session_meta","payload":{"id":"headless-rollout"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","model":"gpt-4o","usage":{"input_tokens":13,"output_tokens":4}}"#,
             "\n"
         );
         let plain_path = dir.path().join("headless.jsonl");
@@ -4508,8 +4584,17 @@ mod tests {
         assert_eq!(plain[0].dedup_key, compressed[0].dedup_key);
         assert_eq!(
             plain[0].dedup_key.as_deref(),
-            Some("codex:usage-fallback:16:headless-rollout:0:6:gpt-4o")
+            Some("codex:usage-fallback:16:headless-rollout:0:6:gpt-4o:12:3:0:0:0:0")
         );
+
+        std::fs::write(&plain_path, diverged).unwrap();
+        let rewritten = parse_codex_file(&plain_path);
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(
+            rewritten[0].dedup_key.as_deref(),
+            Some("codex:usage-fallback:16:headless-rollout:0:6:gpt-4o:13:4:0:0:0:0")
+        );
+        assert_ne!(rewritten[0].dedup_key, compressed[0].dedup_key);
     }
 
     #[test]

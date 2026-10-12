@@ -7557,21 +7557,39 @@ mod tests {
 
     #[test]
     #[serial]
-    fn codex_plain_and_compressed_fallback_rows_dedup_cold_warm_and_local() {
+    fn codex_fallback_copy_dedup_is_content_sensitive_cold_warm_and_local() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
         let _cache_env = redirect_cache_home(cache_home.path());
         let sessions = source_home.path().join(".codex/sessions");
         std::fs::create_dir_all(&sessions).unwrap();
 
-        // No session_meta id: this exercises the logical stem shared by
-        // `fallback.jsonl` and `fallback.jsonl.zst`.
-        let fallback = concat!(
+        let identical = concat!(
             r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
             "\n",
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            "\n"
+        );
+        let diverged_archive = concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"output_tokens":3}}}}"#,
+            "\n"
+        );
+        let diverged_live = concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"output_tokens":4}}}}"#,
+            "\n"
+        );
+        let prefix_snapshot = concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":40,"output_tokens":5}}}}"#,
+            "\n"
+        );
+        let prefix_append = concat!(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"output_tokens":6}}}}"#,
             "\n"
         );
         let timestamped = concat!(
@@ -7582,36 +7600,75 @@ mod tests {
             r#"{"timestamp":"2026-10-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":1}}}}"#,
             "\n"
         );
-        for (name, contents) in [("fallback", fallback), ("timestamped", timestamped)] {
-            std::fs::write(sessions.join(format!("{name}.jsonl")), contents).unwrap();
+        for (name, plain, archive) in [
+            ("identical", identical, identical),
+            ("diverged", diverged_live, diverged_archive),
+            ("prefix", prefix_snapshot, prefix_snapshot),
+            ("timestamped", timestamped, timestamped),
+        ] {
+            std::fs::write(sessions.join(format!("{name}.jsonl")), plain).unwrap();
             std::fs::write(
                 sessions.join(format!("{name}.jsonl.zst")),
-                zstd::encode_all(contents.as_bytes(), 0).unwrap(),
+                zstd::encode_all(archive.as_bytes(), 0).unwrap(),
             )
             .unwrap();
         }
 
         let clients = vec!["codex".to_string()];
         let home = source_home.path().to_str().unwrap();
-        let assert_usage = |label: &str, messages: &[UnifiedMessage]| {
-            assert_eq!(messages.len(), 3, "{label}");
+        let cold = parse_all_messages_with_pricing(home, &clients, None);
+        assert_eq!(cold.len(), 5, "cold cache must retain both diverged rows");
+        assert_eq!(
+            cold.iter().map(|message| message.tokens.input).sum::<i64>(),
+            107
+        );
+        let cold_keys = cold
+            .iter()
+            .map(|message| message.dedup_key.as_deref().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(cold_keys.len(), 5);
+        assert!(cold_keys.contains("codex:usage-fallback:9:identical:0:5:gpt-5:10:2:0:0:0:0"));
+        assert!(cold_keys.contains("codex:usage-fallback:8:diverged:0:5:gpt-5:20:3:0:0:0:0"));
+        assert!(cold_keys.contains("codex:usage-fallback:8:diverged:0:5:gpt-5:30:4:0:0:0:0"));
+        assert!(cold_keys.contains("codex:usage-fallback:6:prefix:0:5:gpt-5:40:5:0:0:0:0"));
+        assert!(cold_keys.contains("codex:token_count:1790812801000:openai:gpt-5:7:1:0:0:0"));
+
+        let mut live_prefix = std::fs::OpenOptions::new()
+            .append(true)
+            .open(sessions.join("prefix.jsonl"))
+            .unwrap();
+        live_prefix.write_all(prefix_append.as_bytes()).unwrap();
+        live_prefix.flush().unwrap();
+        drop(live_prefix);
+
+        let assert_grown_usage = |label: &str, messages: &[UnifiedMessage]| {
+            assert_eq!(messages.len(), 6, "{label}");
             assert_eq!(
                 messages
                     .iter()
                     .map(|message| message.tokens.input)
                     .sum::<i64>(),
-                27,
+                157,
                 "{label}"
             );
             let keys = messages
                 .iter()
                 .map(|message| message.dedup_key.as_deref().unwrap())
                 .collect::<HashSet<_>>();
-            assert_eq!(keys.len(), 3, "{label}");
+            assert_eq!(keys.len(), 6, "{label}");
             assert!(
-                keys.contains("codex:usage-fallback:8:fallback:0:5:gpt-5")
-                    && keys.contains("codex:usage-fallback:8:fallback:1:5:gpt-5"),
-                "plain and compressed stems must share distinct event keys ({label})"
+                keys.contains("codex:usage-fallback:9:identical:0:5:gpt-5:10:2:0:0:0:0"),
+                "identical copies must collapse ({label})"
+            );
+            assert!(
+                keys.contains("codex:usage-fallback:8:diverged:0:5:gpt-5:20:3:0:0:0:0")
+                    && keys.contains("codex:usage-fallback:8:diverged:0:5:gpt-5:30:4:0:0:0:0"),
+                "same-ordinal rows with different usage must both survive ({label})"
+            );
+            assert!(
+                keys.contains("codex:usage-fallback:6:prefix:0:5:gpt-5:40:5:0:0:0:0")
+                    && keys.contains("codex:usage-fallback:6:prefix:1:5:gpt-5:50:6:0:0:0:0"),
+                "a prefix snapshot must not duplicate the prefix or hide the live suffix ({label})"
             );
             assert!(
                 keys.contains("codex:token_count:1790812801000:openai:gpt-5:7:1:0:0:0"),
@@ -7619,10 +7676,10 @@ mod tests {
             );
         };
 
-        let cold = parse_all_messages_with_pricing(home, &clients, None);
-        assert_usage("cold cache", &cold);
-        let warm = parse_all_messages_with_pricing(home, &clients, None);
-        assert_usage("warm cache", &warm);
+        let warm_after_append = parse_all_messages_with_pricing(home, &clients, None);
+        assert_grown_usage("warm incremental append", &warm_after_append);
+        let warm_unchanged = parse_all_messages_with_pricing(home, &clients, None);
+        assert_grown_usage("warm unchanged cache", &warm_unchanged);
 
         let direct = parse_local_clients(LocalParseOptions {
             home_dir: Some(home.to_string()),
@@ -7631,14 +7688,14 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(direct.counts.get(ClientId::Codex), 3);
+        assert_eq!(direct.counts.get(ClientId::Codex), 6);
         assert_eq!(
             direct
                 .messages
                 .iter()
                 .map(|message| message.input)
                 .sum::<i64>(),
-            27
+            157
         );
     }
 
