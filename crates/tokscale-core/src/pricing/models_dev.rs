@@ -32,13 +32,14 @@ struct ModelCost {
     tiers: Vec<serde_json::Value>,
 }
 
+/// The rates of a tier entry. Which card the entry is comes from its `tier`
+/// object, read separately by [`TierHeader`].
 #[derive(Deserialize)]
 struct ModelCostTier {
     input: Option<f64>,
     output: Option<f64>,
     cache_read: Option<f64>,
     cache_write: Option<f64>,
-    tier: ContextTier,
 }
 
 #[derive(Deserialize)]
@@ -46,6 +47,34 @@ struct ContextTier {
     #[serde(rename = "type")]
     kind: String,
     size: u64,
+}
+
+/// Just the `tier` object of a tier entry, so an entry can be recognised as
+/// the 100K context card even when its rates do not decode.
+#[derive(Deserialize)]
+struct TierHeader {
+    tier: ContextTier,
+}
+
+/// Whether a raw tier entry advertises the `> 100,000` context card. models.dev
+/// spells that boundary both as `size: 100000` and as `size: 100001`.
+fn is_100k_context_tier(entry: &serde_json::Value) -> bool {
+    serde_json::from_value::<TierHeader>(entry.clone()).is_ok_and(|header| {
+        header.tier.kind == "context" && matches!(header.tier.size, 100_000 | 100_001)
+    })
+}
+
+/// A 100K context card this crate can price: input and output are usable
+/// rates, and any cache rate it states is usable too.
+fn readable_100k_tier(entry: &serde_json::Value) -> Option<ModelCostTier> {
+    let tier: ModelCostTier = serde_json::from_value(entry.clone()).ok()?;
+    let stated_rate_is_usable =
+        |rate: Option<f64>| rate.is_none_or(|rate| per_token(rate).is_some());
+    (tier.input.and_then(per_token).is_some()
+        && tier.output.and_then(per_token).is_some()
+        && stated_rate_is_usable(tier.cache_read)
+        && stated_rate_is_usable(tier.cache_write))
+    .then_some(tier)
 }
 
 pub type PricingDataset = HashMap<String, ModelPricing>;
@@ -120,13 +149,24 @@ fn cost_to_pricing(cost: ModelCost) -> Option<ModelPricing> {
     // `size: 100000` and `size: 100001`, depending on the provider row. The
     // Anthropic-specific pricing path decides the actual exclusive boundary;
     // this mapping only preserves either spelling of the published rate card.
-    let above_100k = cost
+    //
+    // Entries are decoded one at a time, so an unrelated or unknown tier is
+    // ignored locally instead of rejecting the provider dataset.
+    let advertised_100k: Vec<&serde_json::Value> = cost
         .tiers
         .iter()
-        // Deserialize entries one at a time so an unrelated/partial tier is
-        // ignored locally instead of rejecting the provider dataset.
-        .filter_map(|tier| serde_json::from_value::<ModelCostTier>(tier.clone()).ok())
-        .find(|tier| tier.tier.kind == "context" && matches!(tier.tier.size, 100_000 | 100_001));
+        .filter(|entry| is_100k_context_tier(entry))
+        .collect();
+    let above_100k = advertised_100k
+        .iter()
+        .find_map(|entry| readable_100k_tier(entry));
+    if !advertised_100k.is_empty() && above_100k.is_none() {
+        // The row advertises a long-context card whose rates cannot be read.
+        // Keeping its flat rates would price long requests at the base card,
+        // the silent under-billing the 100K handling exists to prevent, so the
+        // row is left out and other sources, or an incomplete result, apply.
+        return None;
+    }
 
     Some(ModelPricing {
         input_cost_per_token: Some(input),
@@ -273,9 +313,36 @@ mod tests {
                                     {"input": 5, "output": 6, "tier": "context"},
                                     {"input": 5, "output": 6, "tier": {"type": 1, "size": 100000}},
                                     {"input": 5, "output": 6, "tier": {"type": "context", "size": "100000"}},
-                                    {"input": "not-a-rate", "output": 6, "tier": {"type": "context", "size": 100000}},
                                     {"input": 5, "output": 6, "tier": {"type": "latency", "size": 100000}},
                                     {"input": 5, "output": 6, "tier": {"type": "context", "size": 128000}}
+                                ]
+                            }
+                        },
+                        "unreadable-100k-rate": {
+                            "cost": {
+                                "input": 1,
+                                "output": 2,
+                                "tiers": [
+                                    {"input": "not-a-rate", "output": 6, "tier": {"type": "context", "size": 100000}}
+                                ]
+                            }
+                        },
+                        "100k-card-without-output": {
+                            "cost": {
+                                "input": 1,
+                                "output": 2,
+                                "tiers": [
+                                    {"input": 5, "tier": {"type": "context", "size": 100001}}
+                                ]
+                            }
+                        },
+                        "one-readable-100k-card": {
+                            "cost": {
+                                "input": 1,
+                                "output": 2,
+                                "tiers": [
+                                    {"input": "not-a-rate", "output": 6, "tier": {"type": "context", "size": 100000}},
+                                    {"input": 5, "output": 6, "tier": {"type": "context", "size": 100000}}
                                 ]
                             }
                         },
@@ -332,6 +399,19 @@ mod tests {
             .expect("an unrelated flat model must survive the malformed tier");
         assert_rate(unrelated.input_cost_per_token, 3e-6);
         assert_rate(unrelated.output_cost_per_token, 15e-6);
+
+        // A row that advertises the 100K card but whose card cannot be read
+        // fails closed: it is left out rather than priced at its flat rates
+        // for long requests.
+        assert!(!data.contains_key("mixed-provider/unreadable-100k-rate"));
+        assert!(!data.contains_key("mixed-provider/100k-card-without-output"));
+
+        // One readable 100K card among unreadable ones is enough.
+        let readable = data
+            .get("mixed-provider/one-readable-100k-card")
+            .expect("a readable 100K card keeps the row");
+        assert_rate(readable.input_cost_per_token_above_100k_tokens, 5e-6);
+        assert_rate(readable.output_cost_per_token_above_100k_tokens, 6e-6);
     }
 
     #[tokio::test]
