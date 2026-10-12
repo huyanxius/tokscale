@@ -1744,24 +1744,33 @@ fn sync_timeout_override(
     }
 }
 
-/// `cursor.syncTimeoutSeconds` from settings.json, if it is set and in range.
+/// A `cursor.syncTimeoutSeconds` value the sync can use: a whole number of
+/// seconds in `1..=CURSOR_MAX_SYNC_TIMEOUT_SECS`. Strings, floats, negative
+/// and out-of-range numbers are not.
+fn usable_sync_timeout_setting(raw: &serde_json::Value) -> Option<u64> {
+    raw.as_u64()
+        .filter(|secs| is_valid_sync_timeout_secs(*secs))
+}
+
+/// `cursor.syncTimeoutSeconds` from settings.json, if it is set and usable.
 ///
 /// Only an explicit `tokscale cursor sync` reads this (never the TUI), so an
-/// out-of-range value is reported on stderr - which leaves `--json` stdout
-/// intact - and the default budget is used instead.
+/// unusable value is reported on stderr - which leaves `--json` stdout
+/// intact - and the default budget is used instead. The file keeps the value
+/// as written.
 fn configured_sync_timeout_secs() -> Option<u64> {
-    let secs = crate::tui::settings::Settings::load()
+    let raw = crate::tui::settings::Settings::load()
         .cursor
         .sync_timeout_seconds?;
-    if is_valid_sync_timeout_secs(secs) {
-        Some(secs)
-    } else {
+    let secs = usable_sync_timeout_setting(&raw);
+    if secs.is_none() {
         eprintln!(
-            "Warning: ignoring cursor.syncTimeoutSeconds = {secs} in settings.json \
-             (expected 1-{CURSOR_MAX_SYNC_TIMEOUT_SECS}); using the default sync budget."
+            "Warning: ignoring cursor.syncTimeoutSeconds = {raw} in settings.json \
+             (expected a whole number of seconds, 1-{CURSOR_MAX_SYNC_TIMEOUT_SECS}); \
+             using the default sync budget."
         );
-        None
     }
+    secs
 }
 
 /// `start + budget` without the panic `Instant + Duration` raises on
@@ -2407,6 +2416,30 @@ mod tests {
                 (Some(CURSOR_EXPLICIT_SYNC_TIMEOUT), false),
                 "cursor.syncTimeoutSeconds = {secs} must fall back to the default budget"
             );
+        }
+    }
+
+    #[test]
+    fn test_sync_timeout_setting_must_be_whole_seconds_in_range() {
+        use serde_json::json;
+        assert_eq!(usable_sync_timeout_setting(&json!(600)), Some(600));
+        assert_eq!(usable_sync_timeout_setting(&json!(1)), Some(1));
+        assert_eq!(
+            usable_sync_timeout_setting(&json!(CURSOR_MAX_SYNC_TIMEOUT_SECS)),
+            Some(CURSOR_MAX_SYNC_TIMEOUT_SECS)
+        );
+        for unusable in [
+            json!(0),
+            json!(CURSOR_MAX_SYNC_TIMEOUT_SECS + 1),
+            json!(-5),
+            json!(1.5),
+            json!(600.0),
+            json!("600"),
+            json!(true),
+            json!([600]),
+            json!({ "seconds": 600 }),
+        ] {
+            assert_eq!(usable_sync_timeout_setting(&unusable), None, "{unusable}");
         }
     }
 
