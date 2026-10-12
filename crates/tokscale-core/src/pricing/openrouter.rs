@@ -43,7 +43,9 @@ struct OpenRouterPricing {
 
 #[derive(Deserialize)]
 struct PricingOverride {
-    min_prompt_tokens: u64,
+    /// Read as `f64` so an integral float (`100000.0`) is recognised as well
+    /// as an integer; only the exact 100,000 threshold is used.
+    min_prompt_tokens: f64,
     prompt: String,
     completion: String,
     #[serde(default)]
@@ -152,7 +154,7 @@ fn parse_optional_price(value: Option<&str>) -> Option<Option<f64>> {
 
 fn parse_100k_override(value: &serde_json::Value) -> Option<Parsed100kOverride> {
     let value: PricingOverride = serde_json::from_value(value.clone()).ok()?;
-    if value.min_prompt_tokens != 100_000 {
+    if value.min_prompt_tokens != 100_000.0 {
         return None;
     }
 
@@ -608,6 +610,21 @@ mod tests {
 
         assert_eq!(pricing.cache_read_input_token_cost, Some(1.75e-7));
         assert_eq!(pricing.cache_creation_input_token_cost, Some(2.2e-6));
+    }
+
+    #[test]
+    fn a_100k_override_threshold_may_be_written_as_a_float() {
+        let input_above_100k = |threshold: &str| {
+            let raw = format!(
+                r#"{{"min_prompt_tokens":{threshold},"prompt":"0.0000005","completion":"0.0000025"}}"#
+            );
+            parse_100k_override(&serde_json::from_str(&raw).unwrap()).map(|tier| tier.input)
+        };
+        assert_eq!(input_above_100k("100000"), Some(5e-7));
+        assert_eq!(input_above_100k("100000.0"), Some(5e-7));
+        assert_eq!(input_above_100k("100000.5"), None);
+        assert_eq!(input_above_100k(r#""100000""#), None);
+        assert_eq!(input_above_100k("128000"), None);
     }
 
     #[test]
