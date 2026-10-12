@@ -46,11 +46,16 @@ use std::time::UNIX_EPOCH;
 // message type and migrate with the field empty. Only the Pi-format driver
 // populates it, and every client that driver serves reads Stale through the
 // parser version, so those entries re-parse rather than migrate.
-const CACHE_FORMAT_VERSION: u32 = 10;
+// 11: Billing identity, raw pricing model and estimate state are retained on
+// messages. Entries record a one-time identity backfill generation; released
+// v10/v11 MiCode wire migrations preserve all messages and row provenance.
+const CACHE_FORMAT_VERSION: u32 = 11;
 // MiMo stores exact per-row provenance beside each cached entry. Its envelope
 // version moves too because those entries also serialize UnifiedMessage, so
 // it stays one ahead of CACHE_FORMAT_VERSION as both move together.
-const MICODE_CACHE_FORMAT_VERSION: u32 = 11;
+const MICODE_CACHE_FORMAT_VERSION: u32 = 12;
+const LEGACY_CACHE_FORMAT_VERSION_V10: u32 = 10;
+const LEGACY_MICODE_CACHE_FORMAT_VERSION_V11: u32 = 11;
 const LEGACY_CACHE_FORMAT_VERSION_V4: u32 = 4;
 const LEGACY_CACHE_FORMAT_VERSION_V5: u32 = 5;
 const LEGACY_CACHE_FORMAT_VERSION_V6: u32 = 6;
@@ -1702,6 +1707,7 @@ pub(crate) struct CachedSourceEntry {
     /// field: the namespace-specific envelope serializes it beside that entry.
     #[serde(skip)]
     pub micode_metadata: Option<Vec<crate::sessions::micode::MiMoRowMetadata>>,
+    pub billing_identity_generation: u32,
 }
 
 /// TokenBreakdown wire layout used by cache formats 4 through 8, before
@@ -1831,6 +1837,9 @@ impl From<LegacyUnifiedMessageV7> for UnifiedMessage {
             parent_session_id: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
+            billing_identity: crate::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: crate::sessions::EstimateStatus::Unpriced,
         }
     }
 }
@@ -1916,6 +1925,9 @@ impl From<LegacyUnifiedMessageV8> for UnifiedMessage {
             parent_session_id: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
+            billing_identity: crate::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: crate::sessions::EstimateStatus::Unpriced,
         }
     }
 }
@@ -1999,6 +2011,9 @@ impl From<LegacyUnifiedMessageV9> for UnifiedMessage {
             parent_session_id: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
+            billing_identity: crate::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: crate::sessions::EstimateStatus::Unpriced,
         }
     }
 }
@@ -2065,6 +2080,7 @@ impl From<LegacyCachedSourceEntryV7> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: entry.opencode_incremental,
             micode_metadata: None,
+            billing_identity_generation: 0,
         }
     }
 }
@@ -2098,6 +2114,122 @@ impl From<LegacyCachedSourceEntryV8> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: entry.opencode_incremental,
             micode_metadata: None,
+            billing_identity_generation: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyUnifiedMessageV10 {
+    client: String,
+    model_id: String,
+    provider_id: String,
+    session_id: String,
+    workspace_key: Option<String>,
+    workspace_label: Option<String>,
+    timestamp: i64,
+    date: String,
+    tokens: crate::TokenBreakdown,
+    cost: f64,
+    cost_source: crate::sessions::CostSource,
+    service_tier: Option<String>,
+    duration_ms: Option<i64>,
+    message_count: i32,
+    agent: Option<String>,
+    dedup_key: Option<String>,
+    session_title: Option<String>,
+    parent_session_id: Option<String>,
+    is_turn_start: bool,
+    model_attribution_conflicted: bool,
+}
+
+impl From<LegacyUnifiedMessageV10> for UnifiedMessage {
+    fn from(message: LegacyUnifiedMessageV10) -> Self {
+        Self {
+            client: message.client,
+            model_id: message.model_id,
+            provider_id: message.provider_id,
+            session_id: message.session_id,
+            workspace_key: message.workspace_key,
+            workspace_label: message.workspace_label,
+            timestamp: message.timestamp,
+            date: message.date,
+            tokens: message.tokens,
+            cost: message.cost,
+            cost_source: message.cost_source,
+            service_tier: message.service_tier,
+            duration_ms: message.duration_ms,
+            message_count: message.message_count,
+            agent: message.agent,
+            dedup_key: message.dedup_key,
+            session_title: message.session_title,
+            parent_session_id: message.parent_session_id,
+            is_turn_start: message.is_turn_start,
+            model_attribution_conflicted: message.model_attribution_conflicted,
+            billing_identity: crate::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: crate::sessions::EstimateStatus::Unpriced,
+        }
+    }
+}
+#[cfg(test)]
+impl From<UnifiedMessage> for LegacyUnifiedMessageV10 {
+    fn from(message: UnifiedMessage) -> Self {
+        Self {
+            client: message.client,
+            model_id: message.model_id,
+            provider_id: message.provider_id,
+            session_id: message.session_id,
+            workspace_key: message.workspace_key,
+            workspace_label: message.workspace_label,
+            timestamp: message.timestamp,
+            date: message.date,
+            tokens: message.tokens,
+            cost: message.cost,
+            cost_source: message.cost_source,
+            service_tier: message.service_tier,
+            duration_ms: message.duration_ms,
+            message_count: message.message_count,
+            agent: message.agent,
+            dedup_key: message.dedup_key,
+            session_title: message.session_title,
+            parent_session_id: message.parent_session_id,
+            is_turn_start: message.is_turn_start,
+            model_attribution_conflicted: message.model_attribution_conflicted,
+        }
+    }
+}
+
+/// Exact version-10 entry layout, before `UnifiedMessage` gained
+/// `parent_session_id`. Same shape as version 8 otherwise, and it already
+/// carries the 1-hour cache-write bucket.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyCachedSourceEntryV10 {
+    parser_namespace: String,
+    parser_version: u32,
+    path: CachedPath,
+    fingerprint: SourceFingerprint,
+    messages: Vec<LegacyUnifiedMessageV10>,
+    fallback_timestamp_indices: Vec<usize>,
+    codex_incremental: Option<CodexIncrementalCache>,
+    prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
+    opencode_incremental: Option<crate::sessions::opencode_schema::OpenCodeIncrementalState>,
+}
+
+impl From<LegacyCachedSourceEntryV10> for CachedSourceEntry {
+    fn from(entry: LegacyCachedSourceEntryV10) -> Self {
+        Self {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages.into_iter().map(Into::into).collect(),
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: entry.opencode_incremental,
+            micode_metadata: None,
+            billing_identity_generation: 0,
         }
     }
 }
@@ -2131,6 +2263,7 @@ impl From<LegacyCachedSourceEntryV9> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: entry.opencode_incremental,
             micode_metadata: None,
+            billing_identity_generation: 0,
         }
     }
 }
@@ -2163,6 +2296,7 @@ impl From<LegacyCachedSourceEntryV4> for CachedSourceEntry {
             prime_accounting: None,
             opencode_incremental: None,
             micode_metadata: None,
+            billing_identity_generation: 0,
         }
     }
 }
@@ -2195,6 +2329,7 @@ impl From<LegacyCachedSourceEntryV5> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: None,
             micode_metadata: None,
+            billing_identity_generation: 0,
         }
     }
 }
@@ -2244,6 +2379,7 @@ impl From<LegacyCachedSourceEntryV6> for CachedSourceEntry {
             prime_accounting: entry.prime_accounting,
             opencode_incremental: None,
             micode_metadata: None,
+            billing_identity_generation: 0,
         }
     }
 }
@@ -2268,6 +2404,7 @@ impl CachedSourceEntry {
             prime_accounting: None,
             opencode_incremental: None,
             micode_metadata: None,
+            billing_identity_generation: 1,
         }
     }
 
@@ -2331,6 +2468,7 @@ impl CachedSourceEntry {
             codex_incremental: self.codex_incremental.take(),
             prime_accounting: self.prime_accounting.take(),
             opencode_incremental: self.opencode_incremental.take(),
+            billing_identity_generation: self.billing_identity_generation,
             micode_metadata: self.micode_metadata.take(),
         }
     }
@@ -2696,7 +2834,10 @@ impl SourceMessageCache {
                 }
                 // A source that no longer exists can never be scanned again,
                 // so its entry is dead weight in memory and on disk.
-                if !key.path.to_path_buf().exists() {
+                if !key.path.to_path_buf().exists()
+                    && !entry.is_claude_namespace()
+                    && entry.billing_identity_generation > 0
+                {
                     state.deleted_keys.insert(key, DeletionReason::Missing);
                     state.dirty = true;
                     continue;
@@ -2736,6 +2877,27 @@ impl SourceMessageCache {
         state.deleted_keys.remove(&key);
         state.dirty_keys.insert(key);
         state.dirty = true;
+    }
+
+    /// Claude cache entries can be the only surviving copy of compacted
+    /// history, including after the original transcript disappears.
+    pub(crate) fn missing_claude_history(&self, roots: &[PathBuf]) -> Vec<CachedSourceEntry> {
+        let mut state = self.state();
+        self.ensure_namespace_loaded(&mut state, ClientId::Claude.as_str());
+        let mut entries: Vec<_> = state
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.is_claude_namespace()
+                    && !entry.path.to_path_buf().exists()
+                    && roots
+                        .iter()
+                        .any(|root| entry.path.to_path_buf().starts_with(root))
+            })
+            .cloned()
+            .collect();
+        entries.sort_by_key(|entry| entry.path.to_path_buf());
+        entries
     }
 
     /// Reads an entry without disturbing the cache's copy.
@@ -2990,7 +3152,9 @@ impl SourceMessageCache {
                             &final_path,
                             &error,
                         );
-                        HashMap::new()
+                        // A failed migration/read is not permission to destroy
+                        // historical bytes. Leave the original shard untouched.
+                        continue;
                     }
                 };
 
@@ -3163,6 +3327,36 @@ fn read_shard_with_limit(
         };
     }
 
+    if envelope.format_version == LEGACY_MICODE_CACHE_FORMAT_VERSION_V11
+        && identity.namespace == ClientId::MiMoCode.as_str()
+    {
+        type LegacyMiMoWireEntryV11 = (
+            LegacyCachedSourceEntryV10,
+            Option<Vec<crate::sessions::micode::MiMoRowMetadata>>,
+        );
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<LegacyMiMoWireEntryV11>>(&envelope.payload)
+        {
+            Ok(entries) => ShardReadStatus::Migrated(
+                entries
+                    .into_iter()
+                    .map(|(legacy_entry, metadata)| {
+                        let mut entry = CachedSourceEntry::from(legacy_entry);
+                        entry.micode_metadata = metadata;
+                        if !entry.has_valid_micode_metadata() {
+                            // Keep messages available but make the MiMo loader
+                            // rebuild an invalid or absent provenance pair.
+                            entry.micode_metadata = None;
+                        }
+                        entry
+                    })
+                    .collect(),
+            ),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+
     if envelope.format_version == LEGACY_MICODE_CACHE_FORMAT_VERSION_V10
         && identity.namespace == ClientId::MiMoCode.as_str()
     {
@@ -3284,6 +3478,17 @@ fn read_shard_with_limit(
             match bincode::options()
                 .with_limit(max_shard_bytes)
                 .deserialize::<Vec<LegacyCachedSourceEntryV9>>(&envelope.payload)
+            {
+                Ok(entries) => ShardReadStatus::Migrated(
+                    entries.into_iter().map(CachedSourceEntry::from).collect(),
+                ),
+                Err(error) => ShardReadStatus::Invalid(error.to_string()),
+            }
+        }
+        LEGACY_CACHE_FORMAT_VERSION_V10 => {
+            match bincode::options()
+                .with_limit(max_shard_bytes)
+                .deserialize::<Vec<LegacyCachedSourceEntryV10>>(&envelope.payload)
             {
                 Ok(entries) => ShardReadStatus::Migrated(
                     entries.into_iter().map(CachedSourceEntry::from).collect(),
@@ -7113,6 +7318,7 @@ mod tests {
             &entry.codex_incremental,
             &entry.prime_accounting,
             &entry.opencode_incremental,
+            entry.billing_identity_generation,
         );
         let bytes = bincode::options().serialize(&entry).unwrap();
         assert_eq!(bytes, bincode::options().serialize(&current).unwrap());
@@ -9218,5 +9424,228 @@ mod tests {
             with_slash, with_backslash,
             "inside the verbatim namespace `/` is part of the name, not a separator"
         );
+    }
+    // Include inside message_cache.rs #[cfg(test)] mod tests, where `use super::*` exists.
+    // Frozen bytes are independent of candidate UnifiedMessage fields. Linux x86_64 fixture paths.
+    // This tests the candidate loader, NOT merely serialization of candidate types.
+    #[test]
+    fn provider_pricing_frozen_wire_layouts_keep_historical_messages() {
+        let cases: &[(u32, bool, &[u8])] = &[
+            (
+                4,
+                false,
+                include_bytes!("../tests/fixtures/billing-cache/generic-v4.bin"),
+            ),
+            (
+                5,
+                false,
+                include_bytes!("../tests/fixtures/billing-cache/generic-v5.bin"),
+            ),
+            (
+                6,
+                false,
+                include_bytes!("../tests/fixtures/billing-cache/generic-v6.bin"),
+            ),
+            (
+                7,
+                false,
+                include_bytes!("../tests/fixtures/billing-cache/generic-v7.bin"),
+            ),
+            (
+                8,
+                false,
+                include_bytes!("../tests/fixtures/billing-cache/generic-v8.bin"),
+            ),
+            (
+                9,
+                false,
+                include_bytes!("../tests/fixtures/billing-cache/generic-v9.bin"),
+            ),
+            (
+                10,
+                false,
+                include_bytes!("../tests/fixtures/billing-cache/generic-v10.bin"),
+            ),
+            (
+                8,
+                true,
+                include_bytes!("../tests/fixtures/billing-cache/micode-v8.bin"),
+            ),
+            (
+                9,
+                true,
+                include_bytes!("../tests/fixtures/billing-cache/micode-v9.bin"),
+            ),
+            (
+                10,
+                true,
+                include_bytes!("../tests/fixtures/billing-cache/micode-v10.bin"),
+            ),
+            (
+                11,
+                true,
+                include_bytes!("../tests/fixtures/billing-cache/micode-v11.bin"),
+            ),
+        ];
+        for &(version, micode, bytes) in cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("frozen.bin");
+            std::fs::write(&path, bytes).unwrap();
+            // Real released parser identity; don't patch the envelope to hide a lossy parser bump.
+            let identity = CacheIdentity::for_client(if micode {
+                ClientId::MiMoCode
+            } else {
+                ClientId::Claude
+            });
+            let entries = match read_shard(&path, identity) {
+                ShardReadStatus::Migrated(entries) | ShardReadStatus::Loaded(entries) => entries,
+                _ => panic!(
+                    "released {} v{} must survive",
+                    if micode { "micode" } else { "generic" },
+                    version
+                ),
+            };
+            assert_eq!(entries.len(), 1);
+            let entry = &entries[0];
+            assert_eq!(entry.messages.len(), 3);
+            let message_version = if micode { version - 1 } else { version };
+            for (i, m) in entry.messages.iter().enumerate() {
+                assert_eq!(m.tokens.input, 110000);
+                assert_eq!(m.tokens.output, 70000);
+                assert_eq!(m.tokens.cache_read, 30000);
+                assert_eq!(m.tokens.cache_write, 100000);
+                assert_eq!(
+                    m.tokens.cache_write_1h,
+                    if message_version >= 9 { 25000 } else { 0 }
+                );
+                assert_eq!(m.tokens.reasoning, 13000);
+                assert_eq!(
+                    m.service_tier.as_deref(),
+                    if message_version >= 8 {
+                        Some("priority")
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(
+                    m.parent_session_id.as_deref(),
+                    if message_version >= 10 {
+                        Some("fixture-parent")
+                    } else {
+                        None
+                    }
+                );
+                assert_eq!(m.provider_id, "anthropic");
+                assert_eq!(m.message_count, 2);
+                assert_eq!(m.cost, [7.25, 0.0, 0.375][i]);
+                assert_eq!(
+                    m.cost_source,
+                    if i == 0 {
+                        crate::sessions::CostSource::Estimated
+                    } else {
+                        crate::sessions::CostSource::ProviderReported
+                    }
+                );
+                assert_eq!(
+                    m.dedup_key.as_deref(),
+                    Some(
+                        [
+                            "uuid:live-estimate",
+                            "uuid:compacted-authoritative-zero",
+                            "uuid:compacted-authoritative-paid"
+                        ][i]
+                    )
+                );
+                assert!(matches!(
+                    m.billing_identity,
+                    crate::sessions::BillingIdentity::Unknown
+                )); // Adjust module import if exported elsewhere.
+            }
+            if micode {
+                let rows = entry
+                    .micode_metadata
+                    .as_ref()
+                    .expect("MiCode provenance preserved");
+                assert_eq!(rows.len(), 3);
+                for (i, row) in rows.iter().enumerate() {
+                    assert_eq!(row.session_created_bits, Some(1780000000000.0f64.to_bits()));
+                    assert_eq!(
+                        row.row.created_bits,
+                        (1780000000000.125f64 + i as f64).to_bits()
+                    );
+                    assert_eq!(
+                        row.row.completed_bits,
+                        Some((1780000000050.625f64 + i as f64).to_bits())
+                    );
+                    assert_eq!(row.row.has_embedded_id, i != 1);
+                }
+            } else if version >= 9 {
+                assert_eq!(entry.fallback_timestamp_indices, vec![1, 2, usize::MAX - 1]);
+            } else {
+                // Baseline removes the retention-generation marker only; does not discard rows.
+                assert_eq!(entry.fallback_timestamp_indices, vec![1, 2]);
+            }
+            let rewritten = dir.path().join("rewritten.bin");
+            write_shard_with_limit(&rewritten, identity, &entries, MAX_CACHE_SHARD_BYTES).unwrap();
+            match read_shard(&rewritten, identity) {
+                ShardReadStatus::Loaded(again) => {
+                    assert_eq!(again[0].messages, entry.messages);
+                    assert_eq!(again[0].micode_metadata, entry.micode_metadata);
+                }
+                _ => panic!("rewritten fixture must be current and warm"),
+            }
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "read/migration cannot overwrite fixture input"
+            );
+        }
+    }
+    #[test]
+    #[serial_test::serial]
+    fn legacy_missing_sources_survive_namespace_load_and_save() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        for client in [ClientId::Codex, ClientId::OpenCode, ClientId::MiMoCode] {
+            let identity = CacheIdentity::for_client(client);
+            let source = write_temp_file(b"synthetic legacy source");
+            let path = source.path().to_path_buf();
+            let mut entry = test_entry(identity, &path, "legacy-missing");
+            entry.billing_identity_generation = 0;
+            let mut cache = SourceMessageCache::load();
+            cache.insert(entry);
+            cache.save_if_dirty();
+            drop(source);
+            let mut cache = SourceMessageCache::load();
+            assert_eq!(
+                cache
+                    .get(identity, &path)
+                    .unwrap()
+                    .billing_identity_generation,
+                0
+            );
+            cache.save_if_dirty();
+            assert!(SourceMessageCache::load().get(identity, &path).is_some());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_shard_decode_never_overwrites_original_bytes_on_save() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        let source = write_temp_file(b"synthetic source");
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let mut cache = SourceMessageCache::load();
+        cache.insert(test_entry(identity, source.path(), "before-corruption"));
+        cache.save_if_dirty();
+        let shard = cache_shard_path(identity, source.path());
+        let original = b"synthetic truncated wire payload";
+        std::fs::write(&shard, original).unwrap();
+        let mut cache = SourceMessageCache::load();
+        assert!(cache.get(identity, source.path()).is_none());
+        cache.insert(test_entry(identity, source.path(), "newly-parsed"));
+        cache.save_if_dirty();
+        assert_eq!(std::fs::read(shard).unwrap(), original);
     }
 }

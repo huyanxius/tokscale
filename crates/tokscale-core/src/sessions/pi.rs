@@ -801,6 +801,13 @@ fn parse_pi_format_file_inner(
             usage.to_breakdown(),
             0.0,
             agent.clone(),
+        )
+        .with_billing(
+            message
+                .provider
+                .as_deref()
+                .filter(|provider| accepts_replacement_field(provider, options.lossy_line_reader)),
+            super::BillingIdentityOrigin::ExplicitRecord,
         );
         if let Some(namespace) = dedup_namespace {
             if options.cross_session_dedup {

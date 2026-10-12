@@ -480,6 +480,7 @@ pub fn parse_claude_file_with_cache_and_home(
 
     let reader = BufReader::new(file);
     let mut messages: Vec<UnifiedMessage> = Vec::with_capacity(64);
+    let mut billing_conflicts = std::collections::HashSet::new();
     let mut provider_confidences: Vec<u8> = Vec::with_capacity(64);
     // Maps dedup_key to the index in `messages` of the first occurrence.
     // CC's streaming API writes the same messageId:requestId multiple times as the
@@ -618,6 +619,18 @@ pub fn parse_claude_file_with_cache_and_home(
                     None => continue,
                 };
 
+                let billing_identity = super::BillingIdentity::from_explicit(
+                    message
+                        .provider_id
+                        .as_deref()
+                        .or(entry.provider_id.as_deref())
+                        .or(metadata_provider_hint),
+                    if message.provider_id.is_some() || entry.provider_id.is_some() {
+                        super::BillingIdentityOrigin::ExplicitRecord
+                    } else {
+                        super::BillingIdentityOrigin::ExplicitSession
+                    },
+                );
                 let duplicate_provider_choice = claude_provider_choice_from_parts(
                     message.model.as_deref(),
                     message
@@ -647,6 +660,39 @@ pub fn parse_claude_file_with_cache_and_home(
                     );
                     if usage.reports_cache_split() {
                         split_reporting_dedup_keys.insert(hash.clone());
+                    }
+                    let existing = &mut messages[existing_idx];
+                    let same_model = message.model.as_deref().is_none_or(|raw| {
+                        raw == existing
+                            .pricing_model_id
+                            .as_deref()
+                            .unwrap_or(&existing.model_id)
+                    });
+                    let weaker_identity = matches!(
+                        (&existing.billing_identity, &billing_identity),
+                        (
+                            super::BillingIdentity::Known {
+                                origin: super::BillingIdentityOrigin::ExplicitRecord,
+                                ..
+                            },
+                            super::BillingIdentity::Known {
+                                origin: super::BillingIdentityOrigin::ExplicitSession,
+                                ..
+                            }
+                        )
+                    );
+                    let conflicting_records = matches!((&existing.billing_identity, &billing_identity),
+                        (super::BillingIdentity::Known { id: first, origin: super::BillingIdentityOrigin::ExplicitRecord },
+                         super::BillingIdentity::Known { id: second, origin: super::BillingIdentityOrigin::ExplicitRecord }) if first != second);
+                    if same_model && conflicting_records {
+                        existing.billing_identity = super::BillingIdentity::Unknown;
+                        billing_conflicts.insert(existing_idx);
+                    } else if same_model
+                        && !weaker_identity
+                        && billing_identity.id().is_some()
+                        && !billing_conflicts.contains(&existing_idx)
+                    {
+                        existing.billing_identity = billing_identity.clone();
                     }
                     if let Some(choice) = duplicate_provider_choice {
                         update_claude_provider_id(
@@ -711,6 +757,8 @@ pub fn parse_claude_file_with_cache_and_home(
                         0.0,
                         dedup_key,
                     );
+                    unified.billing_identity = billing_identity;
+                    unified.preserve_pricing_model(&raw_model);
                     unified.duration_ms = duration_ms;
                     unified.agent = sidechain_agent.clone();
                     unified.set_workspace(workspace_key.clone(), workspace_label.clone());
@@ -862,6 +910,8 @@ fn claude_advisor_messages(
                     .as_ref()
                     .map(|key| format!("{key}:advisor:{index}")),
             );
+            advisor.billing_identity = parent.billing_identity.clone();
+            advisor.preserve_pricing_model(model);
             advisor.message_count = 0;
             advisor.agent.clone_from(&parent.agent);
             advisor.set_workspace(parent.workspace_key.clone(), parent.workspace_label.clone());
@@ -969,7 +1019,7 @@ fn cc_mirror_variant_metadata_from_path(
                 .as_deref()
                 .or(metadata.provider.as_deref())
         })
-        .and_then(cc_mirror_provider_id);
+        .map(str::to_string);
 
     Some(CcMirrorVariantMetadata { name, provider_id })
 }
@@ -1111,6 +1161,16 @@ pub(crate) fn merge_message_completeness(
     }
     if candidate.has_authoritative_cost() && !existing.has_authoritative_cost() {
         existing.cost = candidate.cost;
+        // Authoritative amount and its model/channel evidence are one record.
+        existing.model_id.clone_from(&candidate.model_id);
+        existing.provider_id.clone_from(&candidate.provider_id);
+        existing
+            .pricing_model_id
+            .clone_from(&candidate.pricing_model_id);
+        existing
+            .billing_identity
+            .clone_from(&candidate.billing_identity);
+        existing.service_tier.clone_from(&candidate.service_tier);
         existing.mark_provider_reported_cost();
     }
 }
@@ -1264,7 +1324,12 @@ fn extract_claude_tool_result_message(
         usage
             .dedup_key
             .map(|key| tool_result_dedup_key(context.client_id, context.session_id, &key)),
-    );
+    )
+    .with_billing(
+        provider_hint.as_deref(),
+        super::BillingIdentityOrigin::ExplicitRecord,
+    )
+    .with_pricing_model(&raw_model);
     message.message_count = 0;
     message.agent = context.sidechain_agent;
     message.set_workspace(context.workspace_key, context.workspace_label);
@@ -1628,29 +1693,36 @@ fn extract_claude_headless_message(
     let model = canonicalize_claude_model(&raw_model);
     let timestamp = extract_claude_timestamp(value).unwrap_or(fallback_timestamp);
 
-    Some(UnifiedMessage::new(
-        client_id,
-        model,
-        provider_id,
-        session_id.to_string(),
-        timestamp,
-        {
-            let cache_write = extract_i64(usage.get("cache_creation_input_tokens"))
-                .unwrap_or(0)
-                .max(0);
-            TokenBreakdown {
-                input: extract_i64(usage.get("input_tokens")).unwrap_or(0).max(0),
-                output: extract_i64(usage.get("output_tokens")).unwrap_or(0).max(0),
-                cache_read: extract_i64(usage.get("cache_read_input_tokens"))
+    Some(
+        UnifiedMessage::new(
+            client_id,
+            model,
+            provider_id,
+            session_id.to_string(),
+            timestamp,
+            {
+                let cache_write = extract_i64(usage.get("cache_creation_input_tokens"))
                     .unwrap_or(0)
-                    .max(0),
-                cache_write,
-                cache_write_1h: extract_cache_write_1h(usage).min(cache_write),
-                reasoning: 0,
-            }
-        },
-        0.0,
-    ))
+                    .max(0);
+                TokenBreakdown {
+                    input: extract_i64(usage.get("input_tokens")).unwrap_or(0).max(0),
+                    output: extract_i64(usage.get("output_tokens")).unwrap_or(0).max(0),
+                    cache_read: extract_i64(usage.get("cache_read_input_tokens"))
+                        .unwrap_or(0)
+                        .max(0),
+                    cache_write,
+                    cache_write_1h: extract_cache_write_1h(usage).min(cache_write),
+                    reasoning: 0,
+                }
+            },
+            0.0,
+        )
+        .with_billing(
+            provider_hint.as_deref().or(default_provider_hint),
+            super::BillingIdentityOrigin::ExplicitRecord,
+        )
+        .with_pricing_model(&raw_model),
+    )
 }
 
 /// Internal Claude Code system/tool tags that should NOT be counted as human turns.
@@ -1766,7 +1838,7 @@ fn claude_provider_choice_from_hint(
     model: Option<&str>,
     provider_hint: Option<&str>,
 ) -> Option<ClaudeProviderChoice> {
-    let hint = provider_hint.and_then(provider_identity::canonical_provider)?;
+    let hint = provider_hint.and_then(cc_mirror_provider_id)?;
 
     if hint == "anthropic" {
         if let Some(inferred_provider) =
@@ -1880,7 +1952,12 @@ fn finalize_headless_state(
             reasoning: 0,
         },
         0.0,
-    );
+    )
+    .with_billing(
+        state.provider_id.as_deref().or(default_provider_hint),
+        super::BillingIdentityOrigin::ExplicitRecord,
+    )
+    .with_pricing_model(&raw_model);
 
     *state = ClaudeHeadlessState::default();
     Some(message)

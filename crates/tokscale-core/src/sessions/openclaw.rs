@@ -394,16 +394,22 @@ fn ingest_openclaw_entry(
                 )
             });
 
-            Some(UnifiedMessage::new_with_dedup(
-                "openclaw",
-                model,
-                provider,
-                ctx.session_id.to_string(),
-                timestamp,
-                tokens,
-                cost.max(0.0),
-                dedup_key,
-            ))
+            Some(
+                UnifiedMessage::new_with_dedup(
+                    "openclaw",
+                    model,
+                    provider.clone(),
+                    ctx.session_id.to_string(),
+                    timestamp,
+                    tokens,
+                    cost.max(0.0),
+                    dedup_key,
+                )
+                .with_billing(
+                    Some(&provider),
+                    super::BillingIdentityOrigin::ExplicitRecord,
+                ),
+            )
         }
         _ => None,
     }

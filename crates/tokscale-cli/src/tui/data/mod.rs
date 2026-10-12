@@ -2054,6 +2054,9 @@ mod tests {
             parent_session_id: None,
             is_turn_start: false,
             model_attribution_conflicted: false,
+            billing_identity: tokscale_core::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: tokscale_core::sessions::EstimateStatus::Unpriced,
         };
 
         accumulate_session_entry(&mut entry, &msg, 0.0, "test-model", "test-model", true);

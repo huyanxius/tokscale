@@ -2081,3 +2081,9 @@ Tokscale은 [LiteLLM의 가격 데이터베이스](https://github.com/BerriAI/li
 
 이 프로젝트가 흥미롭다면 **스타(⭐)**를 눌러주세요.  
 [GitHub에서 저를 팔로우](https://github.com/junhoyeo)하고 함께 빌드해도 좋아요. (이미 1.1k+명이 탑승해 있어요!)
+
+### 결제 채널별 가격
+
+기존 전역 `models`와 함께 `provider_overrides`를 설정할 수 있습니다. `tokscale pricing MODEL --billing-provider vertex --source custom --json --no-spinner`로 조회합니다. 기존 `--provider`는 여전히 가격표 출처를 뜻합니다. 채널은 로그의 전체 라벨을 공백 제거 및 ASCII 대소문자 무시로 비교하며 모델 제조사에서 추론하지 않습니다. 실제 결제 계정이나 판매자를 검증하는 기능은 아닙니다.
+
+`tokscale pricing validate-overrides --strict --json --no-spinner`로 오프라인 검증하고, `tokscale pricing explain --json --no-spinner`로 메시지별 채널·요율 배수·커버리지·추정 상태를 로컬에서 확인하세요. 사용자 요율은 기본 요율이며 기록된 확정 비용은 0도 유지합니다. 설정 수정 후 재시작하면 과거 추정액도 현재 가격으로 재계산하고 만료된 추정액은 합계에서 제외합니다. 구버전으로 내려가면 채널별 규칙은 무시됩니다. [우선순위, 캐시 이전 및 예제](docs/provider-pricing.md).

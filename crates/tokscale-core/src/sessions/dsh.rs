@@ -444,12 +444,16 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 let mut message = UnifiedMessage::new_with_dedup(
                     "dsh",
                     model_id,
-                    provider_id,
+                    provider_id.clone(),
                     &sid,
                     timestamp,
                     tokens,
                     0.0,
                     Some(dedup_key),
+                )
+                .with_billing(
+                    Some(&provider_id),
+                    super::BillingIdentityOrigin::ExplicitRecord,
                 );
                 message.is_turn_start = is_turn_start;
                 if let Some(cwd) = &workspace_key {

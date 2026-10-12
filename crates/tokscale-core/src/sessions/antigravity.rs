@@ -59,6 +59,7 @@ fn parse_usage_row(value: &Value, fallback_model: Option<&str>) -> Option<Unifie
         .map(|text| text.to_string())
         .or_else(|| fallback_model.map(|text| text.to_string()))
         .unwrap_or_else(|| "unknown".to_string());
+    let raw_model = model_id.clone();
     let model_id = pricing::aliases::resolve_alias(&model_id)
         .unwrap_or(model_id.as_str())
         .to_string();
@@ -86,23 +87,30 @@ fn parse_usage_row(value: &Value, fallback_model: Option<&str>) -> Option<Unifie
         .filter(|text| !text.trim().is_empty())
         .map(|text| text.to_string());
 
-    Some(UnifiedMessage::new_with_dedup(
-        "antigravity",
-        model_id,
-        provider_id,
-        session_id,
-        timestamp,
-        TokenBreakdown {
-            input,
-            output,
-            cache_read,
-            cache_write,
-            cache_write_1h: 0,
-            reasoning,
-        },
-        0.0,
-        dedup_key,
-    ))
+    Some(
+        UnifiedMessage::new_with_dedup(
+            "antigravity",
+            model_id,
+            provider_id,
+            session_id,
+            timestamp,
+            TokenBreakdown {
+                input,
+                output,
+                cache_read,
+                cache_write,
+                cache_write_1h: 0,
+                reasoning,
+            },
+            0.0,
+            dedup_key,
+        )
+        .with_billing(
+            value.get("providerId").and_then(Value::as_str),
+            super::BillingIdentityOrigin::ExplicitRecord,
+        )
+        .with_pricing_model(&raw_model),
+    )
 }
 
 fn infer_provider(model: &str) -> &'static str {

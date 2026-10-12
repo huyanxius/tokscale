@@ -135,6 +135,7 @@ fn query_usage_rows(db_path: &Path, conn: &Connection, query: &str) -> Option<Ve
 }
 
 fn build_message(row: HermesUsageRow, dedup_key: String) -> UnifiedMessage {
+    let billing_provider = row.billing_provider.clone();
     let provider = resolved_provider(row.billing_provider, &row.model_id, "hermes");
     // `reasoning_tokens` is `completion_tokens_details.reasoning_tokens`, a
     // SUBSET of the `completion_tokens` Hermes stores in `output_tokens`:
@@ -166,6 +167,10 @@ fn build_message(row: HermesUsageRow, dedup_key: String) -> UnifiedMessage {
         },
         row.cost.max(0.0),
         Some(HERMES_AGENT_NAME.to_string()),
+    )
+    .with_billing(
+        billing_provider.as_deref(),
+        super::BillingIdentityOrigin::ExplicitRecord,
     );
     msg.message_count = row.message_count.max(0);
     msg.dedup_key = Some(dedup_key);

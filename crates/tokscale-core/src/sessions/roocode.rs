@@ -116,23 +116,32 @@ pub(crate) fn parse_roo_kilo_file(path: &Path, source: &str) -> Vec<UnifiedMessa
                 .unwrap_or_else(|| "unknown".to_string()),
         };
 
-        messages.push(UnifiedMessage::new_with_agent(
-            source,
-            model,
-            provider,
-            session_id.clone(),
-            timestamp,
-            TokenBreakdown {
-                input: payload.tokens_in,
-                output: payload.tokens_out,
-                cache_read: payload.cache_reads,
-                cache_write: payload.cache_writes,
-                cache_write_1h: 0,
-                reasoning: 0,
-            },
-            payload.cost,
-            agent.clone(),
-        ));
+        messages.push(
+            UnifiedMessage::new_with_agent(
+                source,
+                model,
+                provider.clone(),
+                session_id.clone(),
+                timestamp,
+                TokenBreakdown {
+                    input: payload.tokens_in,
+                    output: payload.tokens_out,
+                    cache_read: payload.cache_reads,
+                    cache_write: payload.cache_writes,
+                    cache_write_1h: 0,
+                    reasoning: 0,
+                },
+                payload.cost,
+                agent.clone(),
+            )
+            .with_billing(
+                entry
+                    .model_info
+                    .as_ref()
+                    .and_then(|info| info.provider_id.as_deref()),
+                super::BillingIdentityOrigin::ExplicitRecord,
+            ),
+        );
     }
 
     messages

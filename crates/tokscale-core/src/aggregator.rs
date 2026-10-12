@@ -688,6 +688,9 @@ mod tests {
             parent_session_id: None,
             is_turn_start: false,
             model_attribution_conflicted: false,
+            billing_identity: crate::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: crate::sessions::EstimateStatus::Unpriced,
         }
     }
 
@@ -1340,6 +1343,9 @@ mod tests {
             parent_session_id: None,
             is_turn_start: false,
             model_attribution_conflicted: false,
+            billing_identity: crate::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: crate::sessions::EstimateStatus::Unpriced,
             duration_ms: None,
         }
     }

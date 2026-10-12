@@ -2135,3 +2135,9 @@ Contributions are welcome! Please follow these steps:
 </p>
 
 If you find this project intriguing, **please consider starring it ⭐** or [follow me on GitHub](https://github.com/junhoyeo) and join the ride (1.1k+ already aboard). I code around the clock and ship mind-blowing things on a regular basis—your support won't go to waste.
+
+### Billing-channel pricing
+
+Custom pricing now supports `provider_overrides` alongside the existing global `models` object. Use `tokscale pricing MODEL --billing-provider vertex --source custom --json --no-spinner`; the old `--provider` flag still means pricing source. Channels are exact whole log labels (trim + ASCII case-insensitive), not inferred model vendors or verified billing accounts. Unknown channels only use global/upstream estimates.
+
+Run `tokscale pricing validate-overrides --strict --json --no-spinner` to check configuration offline and `tokscale pricing explain --json --no-spinner` for local per-message scope, coverage, multiplier and estimate status. Rules are base rates; authoritative costs including zero are preserved. Restart after editing: historical estimates use current rates, while missing/stale prices do not remain in totals. Older binaries ignore scoped rules on downgrade. [Full contract, precedence, cache behavior and example](docs/provider-pricing.md).

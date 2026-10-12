@@ -134,6 +134,7 @@ pub struct CodexModelInfo {
 /// affect usage accounting.
 #[derive(Debug, Deserialize)]
 pub struct CodexThreadSettings {
+    pub model_provider_id: Option<String>,
     pub service_tier: Option<String>,
 }
 
@@ -576,6 +577,11 @@ fn parse_codex_reader<R: BufRead>(
                     && payload.payload_type.as_deref() == Some("thread_settings_applied")
                     && !state.forked_child_waiting_for_turn_context
                 {
+                    if let Some(settings) = payload.thread_settings.as_ref() {
+                        if let Some(provider) = &settings.model_provider_id {
+                            state.session_provider = Some(provider.clone());
+                        }
+                    }
                     if payload.thread_settings.is_some() {
                         // A snapshot without a tier (standard processing)
                         // clears the sticky tier from then on.
@@ -1026,6 +1032,10 @@ fn parse_codex_reader<R: BufRead>(
                         tokens,
                         0.0,
                         agent,
+                    )
+                    .with_billing(
+                        state.session_provider.as_deref(),
+                        super::BillingIdentityOrigin::ExplicitSession,
                     );
                     message.service_tier = state
                         .request_service_tier
@@ -1688,6 +1698,10 @@ fn parse_codex_headless_line(
             },
             0.0,
             agent,
+        )
+        .with_billing(
+            state.session_provider.as_deref(),
+            super::BillingIdentityOrigin::ExplicitSession,
         ),
         usage.timestamp_ms.is_none(),
     ))

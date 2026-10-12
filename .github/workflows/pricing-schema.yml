@@ -1,0 +1,23 @@
+name: Pricing schema
+on:
+  push:
+    branches: [main]
+    paths: &pricing_schema_paths
+      - 'schemas/custom-pricing.schema.json'
+      - 'examples/custom-pricing.json'
+      - 'scripts/validate-pricing-schema.py'
+      - '.github/workflows/pricing-schema.yml'
+  pull_request:
+    paths: *pricing_schema_paths
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install jsonschema==4.26.0
+      - run: python scripts/validate-pricing-schema.py

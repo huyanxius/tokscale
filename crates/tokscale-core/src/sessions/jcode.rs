@@ -132,6 +132,7 @@ fn tokens_from_usage(usage: &JcodeTokenUsage) -> TokenBreakdown {
 
 #[derive(Debug, Clone)]
 struct JcodeSessionContext {
+    billing_provider: Option<String>,
     session_id: String,
     model: String,
     provider: String,
@@ -157,6 +158,7 @@ impl JcodeSessionContext {
             session_id,
             model: model_id(session.model.as_deref()),
             provider: provider_id(session.provider_key.as_deref()),
+            billing_provider: session.provider_key.clone(),
             workspace_key,
             workspace_label,
             pending_turn_start: false,
@@ -170,6 +172,7 @@ impl JcodeSessionContext {
         }
         if let Some(provider_key) = meta.provider_key.as_deref() {
             self.provider = provider_id(Some(provider_key));
+            self.billing_provider = Some(provider_key.to_string());
         }
         if let Some(working_dir) = meta.working_dir.as_deref() {
             self.workspace_key = normalize_workspace_key(working_dir);
@@ -273,6 +276,10 @@ fn parse_jcode_messages(
                 tokens,
                 0.0,
                 Some(dedup_key),
+            )
+            .with_billing(
+                context.billing_provider.as_deref(),
+                super::BillingIdentityOrigin::ExplicitRecord,
             );
             unified.duration_ms = duration_ms;
             if !is_replacement

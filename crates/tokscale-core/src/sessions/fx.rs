@@ -348,6 +348,9 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             parent_session_id: None,
             is_turn_start: false,
             model_attribution_conflicted: false,
+            billing_identity: super::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: crate::sessions::EstimateStatus::Unpriced,
         });
     }
 
@@ -389,6 +392,9 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
                 parent_session_id: None,
                 is_turn_start: false,
                 model_attribution_conflicted: false,
+                billing_identity: crate::sessions::BillingIdentity::Unknown,
+                pricing_model_id: None,
+                estimate_status: crate::sessions::EstimateStatus::Unpriced,
             });
         }
     }

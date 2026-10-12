@@ -251,6 +251,10 @@ pub fn parse_cline_cli_file(path: &Path) -> Vec<UnifiedMessage> {
             },
             cost,
             file.agent.clone(),
+        )
+        .with_billing(
+            Some(&current_provider),
+            super::BillingIdentityOrigin::ExplicitRecord,
         );
         message.dedup_key = Some(dedup_key);
         message.is_turn_start = pending_turn_start;

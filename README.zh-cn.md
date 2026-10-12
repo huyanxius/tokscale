@@ -2079,3 +2079,9 @@ Tokscale 从 [LiteLLM 的价格数据库](https://github.com/BerriAI/litellm/blo
 </p>
 
 如果您觉得这个项目有趣，**请考虑给它一个星标 ⭐** 或 [在 GitHub 上关注我](https://github.com/junhoyeo) 加入旅程（已有 1.1k+ 人加入）。我全天候编程，定期发布令人惊叹的东西——您的支持不会白费。
+
+### 按计费渠道设置价格
+
+自定义价格保留原有全局 `models`，新增 `provider_overrides`。查询示例：`tokscale pricing MODEL --billing-provider vertex --source custom --json --no-spinner`。旧 `--provider` 仍表示价格表来源。渠道按日志完整标签匹配（去首尾空白、ASCII 大小写不敏感），不从模型厂商推断，也不代表已验证的账户或真实收款商。未知渠道只使用全局规则或上游估价。
+
+用 `tokscale pricing validate-overrides --strict --json --no-spinner` 离线校验；用 `tokscale pricing explain --json --no-spinner` 查看本地逐消息渠道、覆盖情况、倍率和费用状态。自定义费率为基础价；日志权威金额（包括零）始终保留。编辑后重启，历史估价按当前价格重算，失效旧估价不混入合计。降级旧二进制会忽略渠道规则。匹配顺序为渠道原始模型→全局原始模型→渠道 synthetic 归一模型→全局归一模型。重复渠道选择器整组禁用，缺少费用桶不会借用其他渠道。缓存升级保留 compacted 历史，不上传私有渠道诊断。[完整说明与示例](docs/provider-pricing.md)。

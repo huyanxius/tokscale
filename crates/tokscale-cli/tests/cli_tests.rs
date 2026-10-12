@@ -5832,7 +5832,7 @@ fn test_submit_includes_unpriced_usage_at_zero_and_keeps_the_rest() {
         "the hint must name the custom pricing file: {stdout}"
     );
     assert!(
-        stdout.contains("keyed by the model id alone"),
+        stdout.contains("using global `models` or scoped `provider_overrides`"),
         "the hint must state the key format, since the warning above prints provider/model but CustomPricing::lookup keys on the model id: {stdout}"
     );
     assert!(
@@ -7245,4 +7245,114 @@ fn test_codex_compressed_session_reports_usage() {
     assert_eq!(json["totalCacheRead"].as_i64().unwrap(), 30);
     assert_eq!(json["totalOutput"].as_i64().unwrap(), 10);
     assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
+}
+
+#[test]
+fn billing_custom_cli_is_offline_and_keeps_old_source_flag() {
+    let tmp = TempDir::new().unwrap();
+    let config = sandbox_config_dir(tmp.path());
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("custom-pricing.json"),r#"{"models":{"atlas":{"input_cost_per_million_tokens":9}},"provider_overrides":[{"provider_id":" Vertex ","model_id":"atlas","pricing":{"input_cost_per_million_tokens":2}}]}"#).unwrap();
+    for source_flag in ["--source", "--provider"] {
+        let output = cmd_with_home(tmp.path())
+            .timeout(Duration::from_secs(10))
+            .args([
+                "pricing",
+                "atlas",
+                source_flag,
+                "custom",
+                "--billing-provider",
+                "vertex",
+                "--json",
+                "--no-spinner",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value["scope"], "provider");
+        assert_eq!(value["matchedProviderId"], "vertex");
+        assert_eq!(value["pricing"]["inputCostPerToken"], 0.000002);
+        assert_eq!(value["missingRates"], serde_json::json!(["output"]));
+    }
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "atlas",
+            "--provider",
+            "custom",
+            "--json",
+            "--no-spinner",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["scope"], "global");
+    cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "validate-overrides",
+            "--strict",
+            "--json",
+            "--no-spinner",
+        ])
+        .assert()
+        .success();
+    let output = cmd_with_home(tmp.path())
+        .args(["pricing", "list-overrides", "--json", "--no-spinner"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["count"], 2);
+    assert_eq!(value["models"][0]["scope"], "global");
+    assert_eq!(value["models"][1]["providerId"], "vertex");
+}
+
+#[test]
+fn billing_strict_validation_rejects_invalid_and_unreadable_configuration() {
+    let tmp = TempDir::new().unwrap();
+    let config = sandbox_config_dir(tmp.path());
+    fs::create_dir_all(&config).unwrap();
+    let file = config.join("custom-pricing.json");
+    fs::write(&file,r#"{"provider_overrides":[{"provider_id":"unknown","model_id":"atlas","pricing":{"input_cost_per_token":1}}]}"#).unwrap();
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "validate-overrides",
+            "--strict",
+            "--json",
+            "--no-spinner",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["valid"], false);
+    fs::remove_file(&file).unwrap();
+    fs::create_dir(&file).unwrap();
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "validate-overrides",
+            "--strict",
+            "--json",
+            "--no-spinner",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["diagnostics"][0]["code"], "io_error");
 }

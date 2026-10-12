@@ -138,6 +138,10 @@ pub fn parse_junie_file(path: &Path) -> Vec<UnifiedMessage> {
                 tokens,
                 cost,
                 agent.clone(),
+            )
+            .with_billing(
+                string_field(usage, "provider"),
+                super::BillingIdentityOrigin::ExplicitRecord,
             );
             message.dedup_key = Some(dedup_key);
             message.duration_ms = duration_ms;
