@@ -2313,9 +2313,13 @@ mod tests {
         );
     }
 
-    /// Pins the fixture rule the per-turn test above relies on, against the
-    /// real decoder rather than a model of it: every second the fixture can
-    /// draw, and the turn two days before it, decodes to itself.
+    /// Pins the fixture rule the per-turn test above relies on. The rule is a
+    /// byte property: for an odd second, the byte-reversed mirror of
+    /// `seconds * 1_000_000` starts with 0x40 or 0xC0 and decodes to no
+    /// plausible time in any unit. The test asserts that property directly,
+    /// then checks with the real decoder that the fixture second and the turn
+    /// two days before it date to themselves. It samples a dense window around
+    /// the second that failed CI and a sparse sweep to 2099.
     #[test]
     fn per_turn_fixture_seconds_never_land_in_the_ambiguous_zone() {
         const TWO_DAYS_SECS: i64 = 2 * 24 * 60 * 60;
@@ -2332,11 +2336,17 @@ mod tests {
         assert_eq!(decode(failed_ci, failed_ci + 3_600), None);
 
         let dense = (failed_ci - 100_000)..(failed_ci + 100_000);
-        let sparse = (session_created_ms / 1_000 + 3 * 24 * 60 * 60..4_070_908_800).step_by(9_973);
+        let sparse = (session_created_ms / 1_000 + 3 * 24 * 60 * 60..4_070_908_800).step_by(99_991);
         for seconds in dense.chain(sparse) {
             let now_ish = unambiguous_micros_fixture_seconds(seconds);
             let scan_secs = now_ish + 3_600;
             for turn_secs in [now_ish, now_ish - TWO_DAYS_SECS] {
+                let raw = ((turn_secs * 1_000_000) as u64).to_le_bytes();
+                assert_eq!(
+                    epoch_scalar_with_unit(u64::from_be_bytes(raw)),
+                    None,
+                    "the mirror of fixture second {turn_secs} must not read as a time"
+                );
                 assert_eq!(
                     decode(turn_secs, scan_secs),
                     Some(turn_secs * 1_000),
