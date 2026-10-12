@@ -25,8 +25,11 @@ struct ModelCost {
     output: Option<f64>,
     cache_read: Option<f64>,
     cache_write: Option<f64>,
+    // Keep each raw entry isolated until mapping. Catalog providers can add a
+    // new tier shape independently, and one such entry must not make serde
+    // reject every model in the shared dataset.
     #[serde(default)]
-    tiers: Vec<ModelCostTier>,
+    tiers: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -120,23 +123,30 @@ fn cost_to_pricing(cost: ModelCost) -> Option<ModelPricing> {
     let above_100k = cost
         .tiers
         .iter()
+        // Deserialize entries one at a time so an unrelated/partial tier is
+        // ignored locally instead of rejecting the provider dataset.
+        .filter_map(|tier| serde_json::from_value::<ModelCostTier>(tier.clone()).ok())
         .find(|tier| tier.tier.kind == "context" && matches!(tier.tier.size, 100_000 | 100_001));
 
     Some(ModelPricing {
         input_cost_per_token: Some(input),
         input_cost_per_token_above_100k_tokens: above_100k
+            .as_ref()
             .and_then(|tier| tier.input)
             .and_then(per_token),
         output_cost_per_token: Some(output),
         output_cost_per_token_above_100k_tokens: above_100k
+            .as_ref()
             .and_then(|tier| tier.output)
             .and_then(per_token),
         cache_read_input_token_cost: cost.cache_read.and_then(per_token),
         cache_read_input_token_cost_above_100k_tokens: above_100k
+            .as_ref()
             .and_then(|tier| tier.cache_read)
             .and_then(per_token),
         cache_creation_input_token_cost: cost.cache_write.and_then(per_token),
         cache_creation_input_token_cost_above_100k_tokens: above_100k
+            .as_ref()
             .and_then(|tier| tier.cache_write)
             .and_then(per_token),
         ..Default::default()
@@ -245,6 +255,83 @@ mod tests {
             pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens, None,
             "models.dev does not publish a separate 1-hour cache-write rate"
         );
+    }
+
+    #[test]
+    fn malformed_tier_entries_do_not_drop_flat_rates_or_other_models() {
+        let data = parse_dataset(
+            r#"{
+                "mixed-provider": {
+                    "models": {
+                        "malformed-tiers": {
+                            "cost": {
+                                "input": 1,
+                                "output": 2,
+                                "tiers": [
+                                    null,
+                                    {"input": 5, "output": 6},
+                                    {"input": 5, "output": 6, "tier": "context"},
+                                    {"input": 5, "output": 6, "tier": {"type": 1, "size": 100000}},
+                                    {"input": 5, "output": 6, "tier": {"type": "context", "size": "100000"}},
+                                    {"input": "not-a-rate", "output": 6, "tier": {"type": "context", "size": 100000}},
+                                    {"input": 5, "output": 6, "tier": {"type": "latency", "size": 100000}},
+                                    {"input": 5, "output": 6, "tier": {"type": "context", "size": 128000}}
+                                ]
+                            }
+                        },
+                        "claude-haiku-5-5": {
+                            "cost": {
+                                "input": 0.1,
+                                "output": 0.5,
+                                "cache_read": 0.01,
+                                "cache_write": 0.125,
+                                "tiers": [{
+                                    "input": 0.5,
+                                    "output": 2.5,
+                                    "cache_read": 0.05,
+                                    "cache_write": 0.625,
+                                    "tier": {"type": "context", "size": 100001}
+                                }]
+                            }
+                        },
+                        "unrelated-model": {
+                            "cost": {"input": 3, "output": 15}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("one malformed tier entry must not reject the provider dataset");
+
+        let assert_rate = |actual: Option<f64>, expected: f64| {
+            let actual = actual.expect("the expected rate must be preserved");
+            assert!((actual - expected).abs() < 1e-18, "rate was {actual}");
+        };
+
+        let malformed = data
+            .get("mixed-provider/malformed-tiers")
+            .expect("the malformed tier row must keep its flat pricing");
+        assert_rate(malformed.input_cost_per_token, 1e-6);
+        assert_rate(malformed.output_cost_per_token, 2e-6);
+        assert_eq!(malformed.input_cost_per_token_above_100k_tokens, None);
+        assert_eq!(malformed.output_cost_per_token_above_100k_tokens, None);
+
+        let haiku = data
+            .get("mixed-provider/claude-haiku-5-5")
+            .expect("a valid tiered model beside the malformed row must survive");
+        assert_rate(haiku.input_cost_per_token_above_100k_tokens, 5e-7);
+        assert_rate(haiku.output_cost_per_token_above_100k_tokens, 2.5e-6);
+        assert_rate(haiku.cache_read_input_token_cost_above_100k_tokens, 5e-8);
+        assert_rate(
+            haiku.cache_creation_input_token_cost_above_100k_tokens,
+            6.25e-7,
+        );
+
+        let unrelated = data
+            .get("mixed-provider/unrelated-model")
+            .expect("an unrelated flat model must survive the malformed tier");
+        assert_rate(unrelated.input_cost_per_token, 3e-6);
+        assert_rate(unrelated.output_cost_per_token, 15e-6);
     }
 
     #[tokio::test]
