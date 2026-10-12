@@ -1371,7 +1371,9 @@ fn parser_version(client: ClientId) -> u32 {
         // v8->v9: chatSessions v3 kind-1 incremental updates are now applied
         // when reconstructing VS Code Copilot Chat requests; v8 aggregates
         // carry those sessions as zero-token.
-        ClientId::Copilot => 9,
+        // v9->v10: scope OTEL line-ordinal fallback keys to their source file
+        // before merging stable snapshots across files.
+        ClientId::Copilot => 10,
         // Devin CLI v1 could stop at a malformed chat_message. v2->v3:
         // message timestamp is now back-calculated to the turn start
         // (created_at - total_time_ms) instead of the recorded (end-anchored)
@@ -4565,8 +4567,68 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_kind1_update_parser_version_invalidates_v8_entries() {
-        assert_eq!(parser_version(ClientId::Copilot), 9);
+    #[serial_test::serial]
+    fn copilot_rebuilds_unscoped_fallback_keys_in_unchanged_v9_sources() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        let otel = home.path().join(".copilot/otel");
+        fs::create_dir_all(&otel).unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Copilot);
+        let predecessor = CacheIdentity {
+            namespace: identity.namespace,
+            parser_version: 9,
+        };
+        let paths = [otel.join("a.jsonl"), otel.join("b.jsonl")];
+        let mut shards: HashMap<_, Vec<_>> = HashMap::new();
+        for path in &paths {
+            fs::write(path, r#"{"type":"span","name":"chat gpt-4o","startTime":[1775934260,0],"attributes":{"gen_ai.operation.name":"chat","gen_ai.response.model":"gpt-4o","gen_ai.conversation.id":"session","gen_ai.usage.input_tokens":10}}"#).unwrap();
+            let fingerprint = SourceFingerprint::from_path(path).unwrap();
+            let mut legacy = crate::sessions::copilot::parse_copilot_file(path);
+            assert_eq!(legacy.len(), 1);
+            legacy[0].dedup_key = Some("span:session:1775934260000:0".to_string());
+            let entry =
+                CachedSourceEntry::new(predecessor, path, fingerprint, legacy, Vec::new(), None);
+            shards
+                .entry(cache_shard_path(identity, path))
+                .or_default()
+                .push(entry);
+        }
+        for (shard, entries) in shards {
+            ensure_cache_dir(shard.parent().unwrap()).unwrap();
+            write_shard_with_limit(&shard, predecessor, &entries, MAX_CACHE_SHARD_BYTES).unwrap();
+        }
+        let scan = || {
+            crate::parse_all_messages_with_pricing_with_env_strategy(
+                home.path().to_str().unwrap(),
+                &["copilot".to_string()],
+                None,
+                false,
+                &crate::scanner::ScannerSettings::default(),
+            )
+        };
+        let rebuilt = scan();
+        assert_eq!(rebuilt.len(), 2);
+        assert_ne!(rebuilt[0].dedup_key, rebuilt[1].dedup_key);
+        let cache = SourceMessageCache::load();
+        for path in &paths {
+            let entry = cache.get(identity, path).unwrap();
+            assert_eq!(entry.parser_version, 10);
+            assert!(entry.messages[0]
+                .dedup_key
+                .as_ref()
+                .unwrap()
+                .starts_with("file:"));
+            assert!(matches!(
+                SourceFingerprint::check_path_samples_only(path, Some(&entry.fingerprint)),
+                Some(FingerprintStatus::Unchanged)
+            ));
+        }
+        assert_eq!(scan(), rebuilt);
+    }
+
+    #[test]
+    fn test_copilot_file_scoped_keys_parser_version_invalidates_v9_entries() {
+        assert_eq!(parser_version(ClientId::Copilot), 10);
     }
 
     #[test]

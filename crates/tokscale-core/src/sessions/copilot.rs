@@ -9,11 +9,13 @@ use super::UnifiedMessage;
 use crate::provider_identity::inferred_provider_from_model;
 use crate::TokenBreakdown;
 use serde_json::{Map, Value};
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub fn parse_copilot_file(path: &Path) -> Vec<UnifiedMessage> {
     let fallback_timestamp = file_modified_timestamp_ms(path);
+    let file_scope = file_scope(path);
     // One read over the file (#1209). A usage record does not always carry
     // its own model, session, or agent id — those often arrive on a different
     // line sharing the same trace id, possibly a *later* line — so the trace
@@ -57,7 +59,7 @@ pub fn parse_copilot_file(path: &Path) -> Vec<UnifiedMessage> {
     let trace_contexts = finish_trace_contexts(contexts, fallback);
     let candidates: Vec<CopilotUsageCandidate> = pending
         .into_iter()
-        .map(|candidate| candidate.resolve(&trace_contexts))
+        .map(|candidate| candidate.resolve(&trace_contexts, &file_scope))
         .collect();
 
     let chat_traces = candidate_trace_contexts(&candidates, CopilotUsageSource::ChatSpan);
@@ -155,7 +157,11 @@ struct PendingUsageCandidate {
 }
 
 impl PendingUsageCandidate {
-    fn resolve(self, trace_contexts: &HashMap<String, TraceContext>) -> CopilotUsageCandidate {
+    fn resolve(
+        self,
+        trace_contexts: &HashMap<String, TraceContext>,
+        file_scope: &str,
+    ) -> CopilotUsageCandidate {
         let trace_context = self
             .trace_id
             .as_deref()
@@ -182,6 +188,23 @@ impl PendingUsageCandidate {
             self.timestamp_ms,
             self.index,
         );
+        // Line ordinals identify records only inside this source file. Keep
+        // stable span/turn keys unchanged, but do not let equal fallback keys
+        // in different exports masquerade as snapshots of the same request.
+        let globally_stable = match self.source {
+            CopilotUsageSource::ChatSpan | CopilotUsageSource::AgentSummarySpan => {
+                self.span_id.is_some()
+            }
+            CopilotUsageSource::InferenceLog => self.trace_id.is_some() && self.span_id.is_some(),
+            CopilotUsageSource::AgentTurnLog => {
+                self.trace_id.is_some() && self.turn_index.is_some()
+            }
+        };
+        let dedup_key = if globally_stable {
+            dedup_key
+        } else {
+            format!("file:{file_scope}:{dedup_key}")
+        };
         // Per-record attribution first: when a chat/inference record carries its
         // own gen_ai.agent.id (e.g. a sub-agent turn inside a shared trace), use
         // it so sub-agents are not mis-attributed to the trace's first agent.
@@ -859,6 +882,71 @@ fn parent_span_id_from_record(value: &Value) -> Option<&str> {
         })
 }
 
+fn file_scope(path: &Path) -> String {
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(path.as_os_str().as_encoded_bytes())
+    )
+}
+
+/// Merge cached or freshly parsed snapshots across OTEL files. A stable key
+/// alone does not retain the parser's timing/attribution provenance, so keep
+/// conflicting attribution or timestamps separate instead of choosing one.
+/// Per-file candidate merging still owns richer partial-boundary handling.
+pub(crate) fn merge_copilot_messages(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
+    let mut merged: Vec<UnifiedMessage> = Vec::with_capacity(messages.len());
+    let mut indexes: HashMap<String, Vec<usize>> = HashMap::new();
+    for message in messages {
+        let Some(key) = message.dedup_key.as_ref() else {
+            merged.push(message);
+            continue;
+        };
+        let candidates = indexes.entry(key.clone()).or_default();
+        let matching = candidates.iter().copied().find(|&index| {
+            let existing = &merged[index];
+            existing.model_id == message.model_id
+                && existing.provider_id == message.provider_id
+                && existing.session_id == message.session_id
+                && existing.agent == message.agent
+                && existing.timestamp == message.timestamp
+        });
+        if let Some(index) = matching {
+            let existing = &mut merged[index];
+            // normalize_input_tokens stores max(input - cache_read, 0).
+            // Adding cache_read recovers max(inclusive_input, cache_read).
+            // Taking both maxima and subtracting the merged cache_read is
+            // therefore equivalent to merging inclusive inputs first, even
+            // when a snapshot reports more cache reads than input tokens.
+            let inclusive_input = existing
+                .tokens
+                .input
+                .saturating_add(existing.tokens.cache_read)
+                .max(
+                    message
+                        .tokens
+                        .input
+                        .saturating_add(message.tokens.cache_read),
+                );
+            existing.tokens = normalize_input_tokens(
+                inclusive_input,
+                existing.tokens.output.max(message.tokens.output),
+                existing.tokens.cache_read.max(message.tokens.cache_read),
+                existing.tokens.cache_write.max(message.tokens.cache_write),
+                existing.tokens.reasoning.max(message.tokens.reasoning),
+            );
+            existing.duration_ms = existing.duration_ms.max(message.duration_ms);
+            // These OTEL rows have no provider-reported cost. The cached
+            // lane must price the merged usage, not either earlier snapshot.
+            existing.cost = 0.0;
+            existing.cost_source = super::CostSource::Unknown;
+        } else {
+            candidates.push(merged.len());
+            merged.push(message);
+        }
+    }
+    merged
+}
+
 fn dedup_key(
     source: CopilotUsageSource,
     trace_id: Option<&str>,
@@ -1084,6 +1172,162 @@ mod tests {
         file.write_all(content.as_bytes()).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    fn snapshot_message(input: i64, cache_read: i64) -> UnifiedMessage {
+        UnifiedMessage::new_with_dedup(
+            "copilot",
+            "gpt-4o",
+            "openai",
+            "session",
+            1_775_934_260_000,
+            normalize_input_tokens(input, 2, cache_read, 3, 4),
+            0.0,
+            Some("trace:span".to_string()),
+        )
+    }
+
+    #[test]
+    fn cross_file_copilot_normalized_merge_matches_inclusive_input_maxima() {
+        // Include over-reported cache reads and the i64 boundary. Testing
+        // normalized-input maxima alone would miss the late-cache regression.
+        let values = [0, 1, 10, 1000, i64::MAX];
+        for input_a in values {
+            for cache_a in values {
+                for input_b in values {
+                    for cache_b in values {
+                        let a = snapshot_message(input_a, cache_a);
+                        let b = snapshot_message(input_b, cache_b);
+                        let expected = normalize_input_tokens(
+                            input_a.max(input_b),
+                            2,
+                            cache_a.max(cache_b),
+                            3,
+                            4,
+                        );
+                        let forward = merge_copilot_messages(vec![a.clone(), b.clone()]);
+                        let reverse = merge_copilot_messages(vec![b.clone(), a.clone()]);
+                        assert_eq!(forward, reverse);
+                        assert_eq!(forward.len(), 1);
+                        assert_eq!(forward[0].tokens, expected);
+                        assert_eq!(
+                            merge_copilot_messages(vec![forward[0].clone(), a, b]),
+                            forward
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cross_file_copilot_merge_is_associative_for_partial_snapshots() {
+        let a = snapshot_message(1000, 0);
+        let b = snapshot_message(1000, 500);
+        let mut c = snapshot_message(1200, 200);
+        c.tokens.output = 20;
+        c.tokens.cache_write = 30;
+        c.tokens.reasoning = 40;
+        c.duration_ms = Some(5000);
+        let expected = merge_copilot_messages(vec![a.clone(), b.clone(), c.clone()]);
+        for order in [
+            vec![a.clone(), c.clone(), b.clone()],
+            vec![b.clone(), a.clone(), c.clone()],
+            vec![b.clone(), c.clone(), a.clone()],
+            vec![c.clone(), a.clone(), b.clone()],
+            vec![c.clone(), b.clone(), a.clone()],
+        ] {
+            assert_eq!(merge_copilot_messages(order), expected);
+        }
+        let mut grouped = merge_copilot_messages(vec![a, b]);
+        grouped.push(c);
+        assert_eq!(merge_copilot_messages(grouped), expected);
+        assert_eq!(expected[0].tokens.input, 700);
+        assert_eq!(expected[0].tokens.cache_read, 500);
+        assert_eq!(expected[0].tokens.output, 20);
+        assert_eq!(expected[0].duration_ms, Some(5000));
+    }
+
+    #[test]
+    fn cross_file_copilot_merge_preserves_ambiguous_attribution_and_timing() {
+        let original = snapshot_message(1000, 0);
+        let mut variants = Vec::new();
+        let mut changed = original.clone();
+        changed.model_id = "different-model".to_string();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.provider_id = "different-provider".to_string();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.session_id = "different-session".to_string();
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.agent = Some("direct-agent".to_string());
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.timestamp += 1000;
+        variants.push(changed);
+        for changed in variants {
+            assert_eq!(
+                merge_copilot_messages(vec![original.clone(), changed.clone()]),
+                vec![original.clone(), changed.clone()]
+            );
+            assert_eq!(
+                merge_copilot_messages(vec![changed.clone(), original.clone()]),
+                vec![changed, original.clone()]
+            );
+        }
+    }
+
+    #[test]
+    fn cross_file_copilot_scopes_only_line_ordinal_fallbacks() {
+        let span = serde_json::json!({
+            "type": "span", "name": "chat gpt-4o", "startTime": [1775934260i64, 0],
+            "attributes": {"gen_ai.operation.name": "chat", "gen_ai.response.model": "gpt-4o", "gen_ai.conversation.id": "session", "gen_ai.usage.input_tokens": 10}
+        });
+        let mut zero_span = span.clone();
+        zero_span["traceId"] = "00000000000000000000000000000000".into();
+        zero_span["spanId"] = "0000000000000000".into();
+        let mut stable_span = span.clone();
+        stable_span["spanId"] = "stable-span".into();
+        let mut turn = serde_json::json!({
+            "hrTime": [1775934260i64, 0], "traceId": "turn-trace",
+            "attributes": {"event.name": "copilot_chat.agent.turn", "gen_ai.request.model": "gpt-4o", "gen_ai.conversation.id": "session", "gen_ai.usage.input_tokens": 10},
+            "_body": "copilot_chat.agent.turn"
+        });
+        let anonymous_turn = turn.clone();
+        turn["attributes"]["turn.index"] = 1.into();
+        let mut untraced_turn = turn.clone();
+        untraced_turn.as_object_mut().unwrap().remove("traceId");
+        let mut inference = serde_json::json!({
+            "hrTime": [1775934260i64, 0], "traceId": "inference-trace",
+            "attributes": {"event.name": "gen_ai.client.inference.operation.details", "gen_ai.response.model": "gpt-4o", "gen_ai.conversation.id": "session", "gen_ai.usage.input_tokens": 10},
+            "_body": "GenAI inference: gpt-4o"
+        });
+        let anonymous_inference = inference.clone();
+        inference["spanId"] = "inference-span".into();
+        for (record, expected_count) in [
+            (span, 2),
+            (zero_span, 2),
+            (stable_span, 1),
+            (anonymous_turn, 2),
+            (turn, 1),
+            (untraced_turn, 2),
+            (anonymous_inference, 2),
+            (inference, 1),
+        ] {
+            let first = create_test_file(&record.to_string());
+            let second = create_test_file(&record.to_string());
+            let mut messages = parse_copilot_file(first.path());
+            assert_eq!(messages.len(), 1, "{record}");
+            assert_eq!(messages, parse_copilot_file(first.path()));
+            messages.extend(parse_copilot_file(second.path()));
+            assert_eq!(
+                merge_copilot_messages(messages).len(),
+                expected_count,
+                "{record}"
+            );
+        }
     }
 
     #[test]
@@ -1554,7 +1798,10 @@ mod tests {
         assert_ne!(keys[0], keys[1], "dedup keys must be unique: {keys:?}");
         for key in &keys {
             assert!(
-                key.starts_with("agent-turn:trace-noidx:idx-"),
+                key.starts_with(&format!(
+                    "file:{}:agent-turn:trace-noidx:idx-",
+                    file_scope(file.path())
+                )),
                 "expected line-index fallback shape in {key}",
             );
         }
@@ -2111,8 +2358,14 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "agent-turn:trace-noidx:idx-0".to_string(),
-                "agent-turn:trace-noidx:idx-1".to_string(),
+                format!(
+                    "file:{}:agent-turn:trace-noidx:idx-0",
+                    file_scope(file.path())
+                ),
+                format!(
+                    "file:{}:agent-turn:trace-noidx:idx-1",
+                    file_scope(file.path())
+                ),
             ],
             "unparsable lines must not shift fallback keys: {keys:?}",
         );
