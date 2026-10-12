@@ -1745,11 +1745,17 @@ fn sync_timeout_override(
 }
 
 /// A `cursor.syncTimeoutSeconds` value the sync can use: a whole number of
-/// seconds in `1..=CURSOR_MAX_SYNC_TIMEOUT_SECS`. Strings, floats, negative
-/// and out-of-range numbers are not.
+/// seconds in `1..=CURSOR_MAX_SYNC_TIMEOUT_SECS`, written as `600` or `600.0`.
+/// Strings, fractions, negative and out-of-range numbers are not.
 fn usable_sync_timeout_setting(raw: &serde_json::Value) -> Option<u64> {
-    raw.as_u64()
-        .filter(|secs| is_valid_sync_timeout_secs(*secs))
+    let secs = raw.as_u64().or_else(|| {
+        raw.as_f64()
+            .filter(|secs| {
+                secs.fract() == 0.0 && (0.0..=CURSOR_MAX_SYNC_TIMEOUT_SECS as f64).contains(secs)
+            })
+            .map(|secs| secs as u64)
+    })?;
+    is_valid_sync_timeout_secs(secs).then_some(secs)
 }
 
 /// `cursor.syncTimeoutSeconds` from settings.json, if it is set and usable.
@@ -2441,12 +2447,19 @@ mod tests {
             usable_sync_timeout_setting(&json!(CURSOR_MAX_SYNC_TIMEOUT_SECS)),
             Some(CURSOR_MAX_SYNC_TIMEOUT_SECS)
         );
+        // `600.0` is a whole number too.
+        assert_eq!(usable_sync_timeout_setting(&json!(600.0)), Some(600));
+        assert_eq!(usable_sync_timeout_setting(&json!(86400.0)), Some(86_400));
         for unusable in [
             json!(0),
+            json!(0.0),
             json!(CURSOR_MAX_SYNC_TIMEOUT_SECS + 1),
+            json!(86401.0),
             json!(-5),
+            json!(-5.0),
             json!(1.5),
-            json!(600.0),
+            json!(600.5),
+            json!(1e300),
             json!("600"),
             json!(true),
             json!([600]),
