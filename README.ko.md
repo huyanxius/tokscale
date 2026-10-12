@@ -668,7 +668,7 @@ tokscale cursor logout --all --purge-cache
 
 로그아웃 시 Tokscale은 캐시된 사용량을 `cursor-cache/archive/`로 옮겨 더 이상 합산되지 않도록 합니다. 캐시된 사용량을 대신 삭제하려면 `--purge-cache`를 사용하세요.
 
-`tokscale cursor sync`는 저장된 각 계정의 사용량 기록을 페이지 단위로 내려받고, 계정마다 전체 시간 예산을 하나씩 적용합니다. 기본 예산은 120초에서 시작해 Cursor가 알려 주는 해당 계정의 사용량 이벤트 수에 맞춰 최대 1800초(30분)까지 늘어납니다. 고정된 예산을 쓰려면 한 번만 적용할 때는 `--timeout <SECONDS>`를 넘기고, 계속 적용하려면 `~/.config/tokscale/settings.json`(Windows: `%APPDATA%\tokscale\settings.json`)에 `cursor.syncTimeoutSeconds`를 저장하세요. 둘 다 1-86400 사이의 정수(초)를 받습니다. 설정에 그 밖의 값이 있으면 Tokscale이 경고를 출력하고 기본 예산을 씁니다. 플래그가 설정보다 우선하고, 설정은 기본 예산보다 우선합니다.
+`tokscale cursor sync`는 저장된 각 계정의 사용량 기록을 페이지 단위로 내려받고, 계정마다 전체 시간 예산을 하나씩 적용합니다. 기본 예산은 120초에서 시작해 Cursor가 알려 주는 해당 계정의 사용량 이벤트 수에 맞춰 최대 1800초(30분)까지 늘어납니다. 고정된 예산을 쓰려면 한 번만 적용할 때는 `--timeout <SECONDS>`를 넘기고, 계속 적용하려면 `~/.config/tokscale/settings.json`(Windows: `%APPDATA%\tokscale\settings.json`)에 `cursor.syncTimeoutSeconds`를 저장하세요. 둘 다 1-86400 사이의 정수(초)를 받습니다. 설정에 그 밖의 값이 있으면 `--timeout` 없이 실행한 `tokscale cursor sync`가 경고를 출력하고 기본 예산을 씁니다. 플래그가 설정보다 우선하고, 설정은 기본 예산보다 우선합니다.
 
 ```json
 {

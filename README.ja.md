@@ -671,7 +671,7 @@ tokscale cursor logout --all --purge-cache
 
 ログアウト時はキャッシュされた履歴を `cursor-cache/archive/` に移動して保持します（そのため集計には含まれません）。完全に削除したい場合は `--purge-cache` を使ってください。
 
-`tokscale cursor sync` は、保存済みの各アカウントの使用量履歴をページ単位で取得し、アカウントごとに 1 つの全体時間予算を適用します。既定の予算は 120 秒から始まり、Cursor が報告するそのアカウントの使用量イベント数に応じて最大 1800 秒（30 分）まで延長されます。固定の予算を使うには、1 回の実行だけなら `--timeout <SECONDS>` を指定し、常に使うなら `~/.config/tokscale/settings.json`（Windows: `%APPDATA%\tokscale\settings.json`）に `cursor.syncTimeoutSeconds` を保存します。どちらも 1-86400 の整数（秒）を受け付けます。設定にそれ以外の値がある場合、Tokscale は警告を表示して既定の予算を使います。フラグは設定より優先され、設定は既定の予算より優先されます。
+`tokscale cursor sync` は、保存済みの各アカウントの使用量履歴をページ単位で取得し、アカウントごとに 1 つの全体時間予算を適用します。既定の予算は 120 秒から始まり、Cursor が報告するそのアカウントの使用量イベント数に応じて最大 1800 秒（30 分）まで延長されます。固定の予算を使うには、1 回の実行だけなら `--timeout <SECONDS>` を指定し、常に使うなら `~/.config/tokscale/settings.json`（Windows: `%APPDATA%\tokscale\settings.json`）に `cursor.syncTimeoutSeconds` を保存します。どちらも 1-86400 の整数（秒）を受け付けます。設定にそれ以外の値がある場合、`--timeout` を付けずに実行した `tokscale cursor sync` は警告を表示して既定の予算を使います。フラグは設定より優先され、設定は既定の予算より優先されます。
 
 ```json
 {

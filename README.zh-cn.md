@@ -667,7 +667,7 @@ tokscale cursor logout --all --purge-cache
 
 登出时，tokscale 会将缓存的历史记录移动到 `cursor-cache/archive/`（因此不会参与合并统计）。如需彻底删除缓存，请使用 `--purge-cache`。
 
-`tokscale cursor sync` 会逐页下载每个已保存账户的使用量历史，并为每个账户设定一个总时间预算。默认预算从 120 秒开始，并根据 Cursor 报告的该账户使用量事件数延长，最多 1800 秒（30 分钟）。如需使用固定预算，可在单次运行时传入 `--timeout <SECONDS>`，或在 `~/.config/tokscale/settings.json`（Windows：`%APPDATA%\tokscale\settings.json`）中保存 `cursor.syncTimeoutSeconds`。两者均接受 1-86400 之间的整数秒；如果设置中是其他值，Tokscale 会显示警告并使用默认预算。命令行选项优先于设置，设置优先于默认预算。
+`tokscale cursor sync` 会逐页下载每个已保存账户的使用量历史，并为每个账户设定一个总时间预算。默认预算从 120 秒开始，并根据 Cursor 报告的该账户使用量事件数延长，最多 1800 秒（30 分钟）。如需使用固定预算，可在单次运行时传入 `--timeout <SECONDS>`，或在 `~/.config/tokscale/settings.json`（Windows：`%APPDATA%\tokscale\settings.json`）中保存 `cursor.syncTimeoutSeconds`。两者均接受 1-86400 之间的整数秒；如果设置中是其他值，不带 `--timeout` 运行的 `tokscale cursor sync` 会显示警告并使用默认预算。命令行选项优先于设置，设置优先于默认预算。
 
 ```json
 {

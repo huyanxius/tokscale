@@ -670,7 +670,7 @@ By default, Tokscale aggregates usage across all saved Cursor accounts by readin
 
 When you log out, Tokscale moves cached usage to `cursor-cache/archive/` so it is no longer aggregated. Use `--purge-cache` to delete cached usage instead.
 
-`tokscale cursor sync` downloads each saved account's usage history page by page and gives each account one overall time budget. By default the budget starts at 120 seconds and grows with the number of usage events Cursor reports for the account, up to 1800 seconds (30 minutes). To use a fixed budget instead, pass `--timeout <SECONDS>` for one run, or save `cursor.syncTimeoutSeconds` in `~/.config/tokscale/settings.json` (Windows: `%APPDATA%\tokscale\settings.json`). Both take a whole number of seconds from 1 to 86400; for any other setting value Tokscale prints a warning and uses the default budget. The flag takes precedence over the setting, and the setting takes precedence over the default budget.
+`tokscale cursor sync` downloads each saved account's usage history page by page and gives each account one overall time budget. By default the budget starts at 120 seconds and grows with the number of usage events Cursor reports for the account, up to 1800 seconds (30 minutes). To use a fixed budget instead, pass `--timeout <SECONDS>` for one run, or save `cursor.syncTimeoutSeconds` in `~/.config/tokscale/settings.json` (Windows: `%APPDATA%\tokscale\settings.json`). Both take a whole number of seconds from 1 to 86400. If the setting holds any other value, `tokscale cursor sync` run without `--timeout` prints a warning and uses the default budget. The flag takes precedence over the setting, and the setting takes precedence over the default budget.
 
 ```json
 {
