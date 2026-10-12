@@ -1773,6 +1773,22 @@ fn configured_sync_timeout_secs() -> Option<u64> {
     secs
 }
 
+/// The persisted budget to consult for this sync, if any. Only an explicit
+/// sync without `--timeout` reads the setting: the flag wins outright, and
+/// reading the setting anyway could warn about a value this run never uses.
+fn setting_budget_for(
+    explicit: bool,
+    explicit_timeout: Option<Duration>,
+    load_setting: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    let flag_given = explicit_timeout.is_some_and(|timeout| !timeout.is_zero());
+    if explicit && !flag_given {
+        load_setting()
+    } else {
+        None
+    }
+}
+
 /// `start + budget` without the panic `Instant + Duration` raises on
 /// overflow. Budgets are bounded by [`CURSOR_MAX_SYNC_TIMEOUT_SECS`], so the
 /// fallback never triggers in practice; it keeps any future caller from
@@ -1796,11 +1812,8 @@ pub async fn sync_cursor_cache_with_explicit_timeout(
     // This avoids stale manually-pasted cookies after Cursor refreshes its JWT.
     let _ = ensure_credentials_from_local_cursor();
 
-    let configured_secs = if explicit {
-        configured_sync_timeout_secs()
-    } else {
-        None
-    };
+    let configured_secs =
+        setting_budget_for(explicit, explicit_timeout, configured_sync_timeout_secs);
     let (timeout, is_custom) = sync_timeout_override(explicit, explicit_timeout, configured_secs);
     sync_cursor_cache_with_fetcher(move |session_token| async move {
         fetch_cursor_usage_events_json_from(
@@ -2441,6 +2454,25 @@ mod tests {
         ] {
             assert_eq!(usable_sync_timeout_setting(&unusable), None, "{unusable}");
         }
+    }
+
+    #[test]
+    fn test_the_timeout_setting_is_read_only_without_the_flag() {
+        let unreachable = || -> Option<u64> { panic!("the setting must not be read") };
+        // `--timeout` wins outright, so the settings file is never consulted.
+        assert_eq!(
+            setting_budget_for(true, Some(Duration::from_secs(300)), unreachable),
+            None
+        );
+        // Implicit (pre-report) syncs never use the explicit budget.
+        assert_eq!(setting_budget_for(false, None, unreachable), None);
+        // An explicit sync without the flag reads it.
+        assert_eq!(setting_budget_for(true, None, || Some(600)), Some(600));
+        // A zero duration is not a flag value (clap rejects 0).
+        assert_eq!(
+            setting_budget_for(true, Some(Duration::ZERO), || Some(600)),
+            Some(600)
+        );
     }
 
     #[test]
