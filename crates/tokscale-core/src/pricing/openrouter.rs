@@ -25,15 +25,39 @@ const MAX_CONCURRENT_REQUESTS: usize = 10;
 /// Structs for `/api/v1/models` endpoint (list all models).
 
 #[derive(Deserialize)]
-struct ModelListPricing {
+struct OpenRouterPricing {
     prompt: String,
     completion: String,
+    #[serde(default)]
+    input_cache_read: Option<String>,
+    #[serde(default)]
+    input_cache_write: Option<String>,
+    #[serde(default)]
+    input_cache_write_1h: Option<String>,
+    // Keep override entries raw until conversion. OpenRouter publishes several
+    // unrelated override shapes, and one malformed entry must not reject the
+    // model list or an endpoint response.
+    #[serde(default, deserialize_with = "deserialize_overrides")]
+    overrides: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct PricingOverride {
+    min_prompt_tokens: u64,
+    prompt: String,
+    completion: String,
+    #[serde(default)]
+    input_cache_read: Option<String>,
+    #[serde(default)]
+    input_cache_write: Option<String>,
+    #[serde(default)]
+    input_cache_write_1h: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ModelListItem {
     id: String,
-    pricing: Option<ModelListPricing>,
+    pricing: Option<OpenRouterPricing>,
 }
 
 #[derive(Deserialize)]
@@ -41,22 +65,23 @@ struct ModelsListResponse {
     data: Vec<ModelListItem>,
 }
 
-/// Structs for `/api/v1/models/{id}/endpoints` endpoint (author pricing).
-
-#[derive(Deserialize)]
-struct EndpointPricing {
-    prompt: String,
-    completion: String,
-    #[serde(default)]
-    input_cache_read: Option<String>,
-    #[serde(default)]
-    input_cache_write: Option<String>,
+fn deserialize_overrides<'de, D>(deserializer: D) -> Result<Vec<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Array(entries) => entries,
+        _ => Vec::new(),
+    })
 }
+
+/// Structs for `/api/v1/models/{id}/endpoints` endpoint (author pricing).
 
 #[derive(Deserialize)]
 struct Endpoint {
     provider_name: String,
-    pricing: EndpointPricing,
+    pricing: OpenRouterPricing,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +135,63 @@ fn parse_price(s: &str) -> Option<f64> {
         .filter(|v| v.is_finite() && *v >= 0.0)
 }
 
+struct Parsed100kOverride {
+    input: f64,
+    output: f64,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+    cache_write_1h: Option<f64>,
+}
+
+fn parse_optional_price(value: Option<&str>) -> Option<Option<f64>> {
+    match value {
+        Some(value) => parse_price(value).map(Some),
+        None => Some(None),
+    }
+}
+
+fn parse_100k_override(value: &serde_json::Value) -> Option<Parsed100kOverride> {
+    let value: PricingOverride = serde_json::from_value(value.clone()).ok()?;
+    if value.min_prompt_tokens != 100_000 {
+        return None;
+    }
+
+    Some(Parsed100kOverride {
+        input: parse_price(&value.prompt)?,
+        output: parse_price(&value.completion)?,
+        cache_read: parse_optional_price(value.input_cache_read.as_deref())?,
+        cache_write: parse_optional_price(value.input_cache_write.as_deref())?,
+        cache_write_1h: parse_optional_price(value.input_cache_write_1h.as_deref())?,
+    })
+}
+
+fn model_pricing(pricing: &OpenRouterPricing) -> Option<ModelPricing> {
+    let above_100k = pricing.overrides.iter().find_map(parse_100k_override);
+
+    Some(ModelPricing {
+        input_cost_per_token: Some(parse_price(&pricing.prompt)?),
+        input_cost_per_token_above_100k_tokens: above_100k.as_ref().map(|tier| tier.input),
+        output_cost_per_token: Some(parse_price(&pricing.completion)?),
+        output_cost_per_token_above_100k_tokens: above_100k.as_ref().map(|tier| tier.output),
+        cache_read_input_token_cost: pricing.input_cache_read.as_deref().and_then(parse_price),
+        cache_read_input_token_cost_above_100k_tokens: above_100k
+            .as_ref()
+            .and_then(|tier| tier.cache_read),
+        cache_creation_input_token_cost: pricing.input_cache_write.as_deref().and_then(parse_price),
+        cache_creation_input_token_cost_above_100k_tokens: above_100k
+            .as_ref()
+            .and_then(|tier| tier.cache_write),
+        cache_creation_input_token_cost_above_1hr: pricing
+            .input_cache_write_1h
+            .as_deref()
+            .and_then(parse_price),
+        cache_creation_input_token_cost_above_1hr_above_100k_tokens: above_100k
+            .as_ref()
+            .and_then(|tier| tier.cache_write_1h),
+        ..Default::default()
+    })
+}
+
 async fn fetch_author_pricing(
     client: Arc<reqwest::Client>,
     api_base: Arc<String>,
@@ -156,21 +238,7 @@ async fn fetch_author_pricing(
 }
 
 fn endpoint_pricing(endpoint: &Endpoint) -> Option<ModelPricing> {
-    Some(ModelPricing {
-        input_cost_per_token: Some(parse_price(&endpoint.pricing.prompt)?),
-        output_cost_per_token: Some(parse_price(&endpoint.pricing.completion)?),
-        cache_read_input_token_cost: endpoint
-            .pricing
-            .input_cache_read
-            .as_deref()
-            .and_then(parse_price),
-        cache_creation_input_token_cost: endpoint
-            .pricing
-            .input_cache_write
-            .as_deref()
-            .and_then(parse_price),
-        ..Default::default()
-    })
+    model_pricing(&endpoint.pricing)
 }
 
 fn quotes_same_base_price(candidate: &ModelPricing, listed: &ModelPricing) -> bool {
@@ -225,36 +293,49 @@ fn select_endpoint_pricing(
 
     if let Some(first) = author_endpoints.first() {
         if let Some(listed) = listed {
-            let standard_tier = fewest_unpriceable_buckets(
-                author_endpoints
-                    .iter()
-                    .copied()
-                    .filter_map(endpoint_pricing)
-                    .filter(|pricing| quotes_same_base_price(pricing, listed)),
-            );
+            let standard_endpoints: Vec<ModelPricing> = author_endpoints
+                .iter()
+                .copied()
+                .filter_map(endpoint_pricing)
+                .filter(|pricing| quotes_same_base_price(pricing, listed))
+                .collect();
             // The first match stands only when no author endpoint quotes the
             // listed price, so a model whose author price legitimately differs
-            // from the listed one is left exactly as it was.
-            if standard_tier.is_some() {
-                return standard_tier;
+            // from the listed one is left exactly as it was. When at least one
+            // endpoint does quote it, keep the listed card in the completeness
+            // arbitration too: a decoded endpoint must not erase cache/tier
+            // buckets that `/models` publishes for the same base deal.
+            if !standard_endpoints.is_empty() {
+                return fewest_unpriceable_buckets(
+                    standard_endpoints
+                        .into_iter()
+                        .chain(std::iter::once(listed.clone())),
+                );
             }
         }
         return endpoint_pricing(first);
     }
 
     let listed = listed?;
+    let matching_endpoints: Vec<ModelPricing> = endpoints
+        .iter()
+        .filter_map(endpoint_pricing)
+        .filter(|pricing| quotes_same_base_price(pricing, listed))
+        .collect();
+    if matching_endpoints.is_empty() {
+        return None;
+    }
     fewest_unpriceable_buckets(
-        endpoints
-            .iter()
-            .filter_map(endpoint_pricing)
-            .filter(|pricing| quotes_same_base_price(pricing, listed)),
+        matching_endpoints
+            .into_iter()
+            .chain(std::iter::once(listed.clone())),
     )
 }
 
 /// Reduce equally-priced candidates to the one that leaves the fewest token
 /// buckets unpriceable.
 ///
-/// Cache read and cache write are independent fields, so the endpoint
+/// Cache buckets and long-context cards are independent fields, so the row
 /// publishing the most of them wins. On an equal count, retain cache-read
 /// pricing: it is the bucket required by Codex usage and must not be lost to
 /// an earlier write-only endpoint.
@@ -262,8 +343,8 @@ fn fewest_unpriceable_buckets(
     candidates: impl Iterator<Item = ModelPricing>,
 ) -> Option<ModelPricing> {
     candidates.reduce(|best, candidate| {
-        if published_cache_rates(&candidate) > published_cache_rates(&best)
-            || (published_cache_rates(&candidate) == published_cache_rates(&best)
+        if published_optional_rates(&candidate) > published_optional_rates(&best)
+            || (published_optional_rates(&candidate) == published_optional_rates(&best)
                 && candidate.cache_read_input_token_cost.is_some()
                 && best.cache_read_input_token_cost.is_none())
         {
@@ -274,9 +355,20 @@ fn fewest_unpriceable_buckets(
     })
 }
 
-fn published_cache_rates(pricing: &ModelPricing) -> usize {
-    usize::from(pricing.cache_read_input_token_cost.is_some())
-        + usize::from(pricing.cache_creation_input_token_cost.is_some())
+fn published_optional_rates(pricing: &ModelPricing) -> usize {
+    [
+        pricing.cache_read_input_token_cost,
+        pricing.cache_creation_input_token_cost,
+        pricing.cache_creation_input_token_cost_above_1hr,
+        pricing.input_cost_per_token_above_100k_tokens,
+        pricing.output_cost_per_token_above_100k_tokens,
+        pricing.cache_read_input_token_cost_above_100k_tokens,
+        pricing.cache_creation_input_token_cost_above_100k_tokens,
+        pricing.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+    ]
+    .into_iter()
+    .filter(Option::is_some)
+    .count()
 }
 
 /// Fetch all models and get author pricing for each
@@ -308,17 +400,7 @@ async fn fetch_all_models_from_api_base(
         .data
         .into_iter()
         .map(|m| {
-            let fallback = m.pricing.and_then(|p| {
-                let input = parse_price(&p.prompt)?;
-                let output = parse_price(&p.completion)?;
-                Some(ModelPricing {
-                    input_cost_per_token: Some(input),
-                    output_cost_per_token: Some(output),
-                    cache_read_input_token_cost: None,
-                    cache_creation_input_token_cost: None,
-                    ..Default::default()
-                })
-            });
+            let fallback = m.pricing.as_ref().and_then(model_pricing);
             (m.id, fallback)
         })
         .collect();
@@ -386,6 +468,7 @@ pub async fn fetch_all_mapped() -> Result<HashMap<String, ModelPricing>, String>
 mod tests {
     use super::*;
     use crate::paths::test_env::EnvGuard;
+    use crate::{pricing::PricingService, TokenBreakdown};
     use serial_test::serial;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -430,11 +513,13 @@ mod tests {
     ) -> Endpoint {
         Endpoint {
             provider_name: provider_name.to_string(),
-            pricing: EndpointPricing {
+            pricing: OpenRouterPricing {
                 prompt: prompt.to_string(),
                 completion: completion.to_string(),
                 input_cache_read: input_cache_read.map(str::to_string),
                 input_cache_write: input_cache_write.map(str::to_string),
+                input_cache_write_1h: None,
+                overrides: Vec::new(),
             },
         }
     }
@@ -643,9 +728,11 @@ mod tests {
     /// Bounded to the two requests a single fetch makes so the thread and its
     /// listening socket are released when the test ends, rather than parking
     /// on `accept` for the life of the test process.
-    fn openrouter_api_server(models_body: &'static str, endpoints_body: &'static str) -> String {
+    fn openrouter_api_server(models_body: &str, endpoints_body: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let models_body = models_body.to_string();
+        let endpoints_body = endpoints_body.to_string();
         thread::spawn(move || {
             for _ in 0..2 {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -655,9 +742,9 @@ mod tests {
                 let read = stream.read(&mut buffer).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..read]).to_string();
                 let body = if request.contains("/endpoints") {
-                    endpoints_body
+                    &endpoints_body
                 } else {
-                    models_body
+                    &models_body
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -667,6 +754,130 @@ mod tests {
             }
         });
         url
+    }
+
+    #[tokio::test]
+    async fn haiku_55_overrides_price_a_long_request_and_ignore_bad_entries() {
+        let pricing = r#"{
+            "prompt":"0.0000001",
+            "completion":"0.0000005",
+            "input_cache_read":"0.00000001",
+            "input_cache_write":"0.000000125",
+            "input_cache_write_1h":"0.0000002",
+            "overrides":[
+                null,
+                {"min_prompt_tokens":100000,"prompt":"not-a-rate","completion":"0.0000025"},
+                {"min_prompt_tokens":128000,"prompt":"9","completion":"9"},
+                {
+                    "min_prompt_tokens":100000,
+                    "prompt":"0.0000005",
+                    "completion":"0.0000025",
+                    "input_cache_read":"0.00000005",
+                    "input_cache_write":"0.000000625",
+                    "input_cache_write_1h":"0.000001"
+                }
+            ]
+        }"#;
+        let incomplete_pricing = r#"{
+            "prompt":"0.0000001",
+            "completion":"0.0000005",
+            "input_cache_read":"0.00000001",
+            "input_cache_write":"0.000000125",
+            "overrides":[
+                {"min_prompt_tokens":100000,"prompt":"not-a-rate","completion":"0.0000025"}
+            ]
+        }"#;
+        let models =
+            format!(r#"{{"data":[{{"id":"anthropic/claude-haiku-5.5","pricing":{pricing}}}]}}"#);
+        let endpoints = format!(
+            r#"{{"data":{{"id":"anthropic/claude-haiku-5.5","endpoints":[
+                {{"provider_name":"Anthropic","pricing":{incomplete_pricing}}},
+                {{"provider_name":"Anthropic","pricing":{pricing}}}
+            ]}}}}"#
+        );
+        let url = openrouter_api_server(&models, &endpoints);
+
+        let data = fetch_all_models_from_api_base(&url, false)
+            .await
+            .expect("bad and unrelated overrides must not drop the OpenRouter model");
+        let row = data
+            .get("anthropic/claude-haiku-5.5")
+            .expect("the Haiku row must survive");
+        assert_eq!(row.cache_creation_input_token_cost_above_1hr, Some(2e-7));
+        assert_eq!(row.input_cost_per_token_above_100k_tokens, Some(5e-7));
+        assert_eq!(row.output_cost_per_token_above_100k_tokens, Some(2.5e-6));
+        assert_eq!(
+            row.cache_read_input_token_cost_above_100k_tokens,
+            Some(5e-8)
+        );
+        assert_eq!(
+            row.cache_creation_input_token_cost_above_100k_tokens,
+            Some(6.25e-7)
+        );
+        assert_eq!(
+            row.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+            Some(1e-6)
+        );
+
+        // The model-list card is also the fallback when the author endpoint
+        // cannot be decoded. Both ingestion legs must preserve the same tier.
+        let fallback_url = openrouter_api_server(&models, "not json");
+        let fallback = fetch_all_models_from_api_base(&fallback_url, false)
+            .await
+            .expect("an invalid endpoint body must retain the listed card");
+        let fallback = fallback
+            .get("anthropic/claude-haiku-5.5")
+            .expect("the listed Haiku card must remain available");
+        assert_eq!(
+            fallback.cache_creation_input_token_cost_above_1hr,
+            Some(2e-7)
+        );
+        assert_eq!(fallback.input_cost_per_token_above_100k_tokens, Some(5e-7));
+        assert_eq!(
+            fallback.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+            Some(1e-6)
+        );
+
+        // A successfully decoded but incomplete same-base endpoint must not
+        // replace the complete card from the model list.
+        let incomplete_endpoints = format!(
+            r#"{{"data":{{"id":"anthropic/claude-haiku-5.5","endpoints":[{{"provider_name":"Anthropic","pricing":{incomplete_pricing}}}]}}}}"#
+        );
+        let fallback_url = openrouter_api_server(&models, &incomplete_endpoints);
+        let fallback = fetch_all_models_from_api_base(&fallback_url, false)
+            .await
+            .expect("the complete listed card must outrank an incomplete endpoint card");
+        let fallback = fallback
+            .get("anthropic/claude-haiku-5.5")
+            .expect("the listed Haiku card must remain available");
+        assert_eq!(
+            fallback.cache_creation_input_token_cost_above_1hr,
+            Some(2e-7)
+        );
+        assert_eq!(fallback.input_cost_per_token_above_100k_tokens, Some(5e-7));
+        assert_eq!(
+            fallback.cache_creation_input_token_cost_above_1hr_above_100k_tokens,
+            Some(1e-6)
+        );
+
+        let service = PricingService::new(HashMap::new(), data);
+        let usage = TokenBreakdown {
+            input: 40_000,
+            output: 100,
+            cache_read: 30_000,
+            cache_write: 30_001,
+            cache_write_1h: 10_000,
+            reasoning: 20,
+        };
+        assert!(service.covers_usage_with_provider("claude-haiku-5.5", Some("anthropic"), &usage,));
+        let cost =
+            service.calculate_cost_with_provider("claude-haiku-5.5", Some("anthropic"), &usage);
+        let expected = 40_000.0 * 5e-7
+            + 120.0 * 2.5e-6
+            + 30_000.0 * 5e-8
+            + 20_001.0 * 6.25e-7
+            + 10_000.0 * 1e-6;
+        assert!((cost - expected).abs() < 1e-12, "cost was {cost}");
     }
 
     /// OpenRouter carried the same defect as LiteLLM and models.dev: the write
