@@ -670,7 +670,7 @@ By default, Tokscale aggregates usage across all saved Cursor accounts by readin
 
 When you log out, Tokscale moves cached usage to `cursor-cache/archive/` so it is no longer aggregated. Use `--purge-cache` to delete cached usage instead.
 
-`tokscale cursor sync` downloads each saved account's usage history page by page and gives each account one overall time budget. By default the budget starts at 120 seconds and grows with the number of usage events Cursor reports for the account, up to 1800 seconds (30 minutes). To use a fixed budget instead, pass `--timeout <SECONDS>` for one run, or save `cursor.syncTimeoutSeconds` in `~/.config/tokscale/settings.json` (Windows: `%APPDATA%\tokscale\settings.json`). Both take a whole number of seconds from 1 to 86400. If the setting holds any other value, `tokscale cursor sync` run without `--timeout` prints a warning and uses the default budget. The flag takes precedence over the setting, and the setting takes precedence over the default budget.
+`tokscale cursor sync` downloads each saved account's usage history page by page and gives each account one overall time budget. By default the budget starts at 120 seconds and grows with the number of usage events Cursor reports for the account, up to 1800 seconds (30 minutes). To use a fixed budget instead, pass `--timeout <SECONDS>` for one run, or save `cursor.syncTimeoutSeconds` in `settings.json` (by default `~/.config/tokscale/settings.json`; see [Configuration](#configuration) for Windows, `XDG_CONFIG_HOME` and `TOKSCALE_CONFIG_DIR`). Both take a whole number of seconds from 1 to 86400. If the setting holds any other value, `tokscale cursor sync` run without `--timeout` prints a warning and uses the default budget. The flag takes precedence over the setting, and the setting takes precedence over the default budget.
 
 ```json
 {
@@ -928,7 +928,7 @@ If those native Codex sources produce no successful usage result, Tokscale reads
 
 ### Configuration
 
-Tokscale stores settings in `~/.config/tokscale/settings.json` (Windows: `%APPDATA%\tokscale\settings.json`):
+Tokscale stores settings in `settings.json` in its config directory. By default that is `~/.config/tokscale/settings.json`. On Linux it is `$XDG_CONFIG_HOME/tokscale/settings.json` when `XDG_CONFIG_HOME` is set, and on Windows it is `%APPDATA%\tokscale\settings.json`. `TOKSCALE_CONFIG_DIR` overrides the directory on every platform:
 
 ```json
 {
@@ -1897,7 +1897,7 @@ Location: `~/.senpi/agent/sessions/<encoded-cwd>/*.jsonl` and `~/.omo/agent/sess
 
 Senpi uses the same JSONL session format as Pi. OmO stores task child sessions inside each project, so Tokscale reads the `cwd` from the session headers in both sessions trees and scans `<project>/.omo/senpi-task/children/` for every project that has one. If OmO's `task.state_dir` is set to an absolute path (in the project's `.omo/omo.jsonc` or `.omo/omo.json`, or in the same file under `~/.omo/`), Tokscale scans `<state_dir>/children/` instead.
 
-If OmO keeps its agent directory somewhere else, add it to `scanner.extraScanPaths.senpi` in `~/.config/tokscale/settings.json` (Windows: `%APPDATA%\tokscale\settings.json`). The entry may point at the agent directory or at its `sessions/` directory. Tokscale scans the sessions there and finds the task children of the projects they record in the same way:
+If OmO keeps its agent directory somewhere else, add it to `scanner.extraScanPaths.senpi` in `settings.json` (by default `~/.config/tokscale/settings.json`; see [Configuration](#configuration) for Windows, `XDG_CONFIG_HOME` and `TOKSCALE_CONFIG_DIR`). The entry may point at the agent directory or at its `sessions/` directory. Tokscale scans the sessions there and finds the task children of the projects they record in the same way:
 
 ```json
 {

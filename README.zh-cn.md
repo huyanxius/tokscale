@@ -667,7 +667,7 @@ tokscale cursor logout --all --purge-cache
 
 登出时，tokscale 会将缓存的历史记录移动到 `cursor-cache/archive/`（因此不会参与合并统计）。如需彻底删除缓存，请使用 `--purge-cache`。
 
-`tokscale cursor sync` 会逐页下载每个已保存账户的使用量历史，并为每个账户设定一个总时间预算。默认预算从 120 秒开始，并根据 Cursor 报告的该账户使用量事件数延长，最多 1800 秒（30 分钟）。如需使用固定预算，可在单次运行时传入 `--timeout <SECONDS>`，或在 `~/.config/tokscale/settings.json`（Windows：`%APPDATA%\tokscale\settings.json`）中保存 `cursor.syncTimeoutSeconds`。两者均接受 1-86400 之间的整数秒；如果设置中是其他值，不带 `--timeout` 运行的 `tokscale cursor sync` 会显示警告并使用默认预算。命令行选项优先于设置，设置优先于默认预算。
+`tokscale cursor sync` 会逐页下载每个已保存账户的使用量历史，并为每个账户设定一个总时间预算。默认预算从 120 秒开始，并根据 Cursor 报告的该账户使用量事件数延长，最多 1800 秒（30 分钟）。如需使用固定预算，可在单次运行时传入 `--timeout <SECONDS>`，或在 `settings.json`（默认位于 `~/.config/tokscale/settings.json`；Windows、`XDG_CONFIG_HOME` 与 `TOKSCALE_CONFIG_DIR` 见[配置](#配置)）中保存 `cursor.syncTimeoutSeconds`。两者均接受 1-86400 之间的整数秒；如果设置中是其他值，不带 `--timeout` 运行的 `tokscale cursor sync` 会显示警告并使用默认预算。命令行选项优先于设置，设置优先于默认预算。
 
 ```json
 {
@@ -919,7 +919,7 @@ tokscale codex status --name personal --json
 
 ### 配置
 
-Tokscale 将设置存储在 `~/.config/tokscale/settings.json`（Windows：`%APPDATA%\tokscale\settings.json`）：
+Tokscale 将设置存储在配置目录下的 `settings.json` 中。默认位置为 `~/.config/tokscale/settings.json`；在 Linux 上若设置了 `XDG_CONFIG_HOME`，则为 `$XDG_CONFIG_HOME/tokscale/settings.json`；在 Windows 上为 `%APPDATA%\tokscale\settings.json`。设置 `TOKSCALE_CONFIG_DIR` 后，所有平台都改用该目录：
 
 ```json
 {
@@ -1844,7 +1844,7 @@ Hermes 将会话级使用量存储在 SQLite `sessions` 表中。Tokscale 导入
 
 Senpi 使用与 Pi 相同的 JSONL 会话格式。OmO 将任务子会话保存在各个项目内部，因此 Tokscale 会从两个会话目录树的会话头中读取 `cwd`，并对每个存在 `<project>/.omo/senpi-task/children/` 的项目扫描该目录。如果 OmO 的 `task.state_dir` 被设置为绝对路径（位于项目的 `.omo/omo.jsonc` 或 `.omo/omo.json`，或 `~/.omo/` 下的同名文件），Tokscale 会改为扫描 `<state_dir>/children/`。
 
-如果 OmO 的 agent 目录位于其他位置，请将其添加到 `~/.config/tokscale/settings.json`（Windows：`%APPDATA%\tokscale\settings.json`）的 `scanner.extraScanPaths.senpi` 中。条目可以指向 agent 目录或其 `sessions/` 目录。Tokscale 会扫描其中的会话，并以同样的方式找到这些会话所记录项目的任务子会话：
+如果 OmO 的 agent 目录位于其他位置，请将其添加到 `settings.json`（默认位于 `~/.config/tokscale/settings.json`；Windows、`XDG_CONFIG_HOME` 与 `TOKSCALE_CONFIG_DIR` 见[配置](#配置)）的 `scanner.extraScanPaths.senpi` 中。条目可以指向 agent 目录或其 `sessions/` 目录。Tokscale 会扫描其中的会话，并以同样的方式找到这些会话所记录项目的任务子会话：
 
 ```json
 {
