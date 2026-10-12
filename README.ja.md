@@ -671,7 +671,7 @@ tokscale cursor logout --all --purge-cache
 
 ログアウト時はキャッシュされた履歴を `cursor-cache/archive/` に移動して保持します（そのため集計には含まれません）。完全に削除したい場合は `--purge-cache` を使ってください。
 
-`tokscale cursor sync` は、保存済みの各アカウントの使用量履歴をページ単位で取得し、アカウントごとに 1 つの全体時間予算を適用します。既定の予算は 120 秒から始まり、Cursor が報告するそのアカウントの使用量イベント数に応じて最大 1800 秒（30 分）まで延長されます。固定の予算を使うには、1 回の実行だけなら `--timeout <SECONDS>` を指定し、常に使うなら `~/.config/tokscale/settings.json` に `cursor.syncTimeoutSeconds` を保存します。どちらも 1-86400 の値を受け付けます。フラグは設定より優先され、設定は既定の予算より優先されます。
+`tokscale cursor sync` は、保存済みの各アカウントの使用量履歴をページ単位で取得し、アカウントごとに 1 つの全体時間予算を適用します。既定の予算は 120 秒から始まり、Cursor が報告するそのアカウントの使用量イベント数に応じて最大 1800 秒（30 分）まで延長されます。固定の予算を使うには、1 回の実行だけなら `--timeout <SECONDS>` を指定し、常に使うなら `~/.config/tokscale/settings.json`（Windows: `%APPDATA%\tokscale\settings.json`）に `cursor.syncTimeoutSeconds` を保存します。どちらも 1-86400 の整数（秒）を受け付けます。設定にそれ以外の値がある場合、Tokscale は警告を表示して既定の予算を使います。フラグは設定より優先され、設定は既定の予算より優先されます。
 
 ```json
 {
@@ -920,7 +920,7 @@ tokscale codex status --name personal --json
 
 ### 設定
 
-Tokscaleは設定を`~/.config/tokscale/settings.json`に保存します：
+Tokscaleは設定を`~/.config/tokscale/settings.json`（Windows: `%APPDATA%\tokscale\settings.json`）に保存します：
 
 ```json
 {
@@ -1807,7 +1807,7 @@ HermesはSQLiteの`sessions`テーブルにセッションレベルの使用量�
 
 Senpi は Pi と同じ JSONL セッション形式を使います。OmO はタスク子セッションを各プロジェクト内に保存するため、Tokscale は両方のセッションツリーにあるセッションヘッダーから `cwd` を読み取り、`<project>/.omo/senpi-task/children/` があるすべてのプロジェクトでそのディレクトリをスキャンします。OmO の `task.state_dir` が絶対パスで設定されている場合（プロジェクトの `.omo/omo.jsonc` または `.omo/omo.json`、あるいは `~/.omo/` 配下の同じファイル）は、代わりに `<state_dir>/children/` をスキャンします。
 
-OmO のエージェントディレクトリが別の場所にある場合は、`~/.config/tokscale/settings.json` の `scanner.extraScanPaths.senpi` に追加してください。エントリはエージェントディレクトリ、またはその `sessions/` ディレクトリを指すことができます。Tokscale はそこにあるセッションをスキャンし、セッションに記録されたプロジェクトのタスク子セッションも同じ方法で見つけます：
+OmO のエージェントディレクトリが別の場所にある場合は、`~/.config/tokscale/settings.json`（Windows: `%APPDATA%\tokscale\settings.json`）の `scanner.extraScanPaths.senpi` に追加してください。エントリはエージェントディレクトリ、またはその `sessions/` ディレクトリを指すことができます。Tokscale はそこにあるセッションをスキャンし、セッションに記録されたプロジェクトのタスク子セッションも同じ方法で見つけます：
 
 ```json
 {

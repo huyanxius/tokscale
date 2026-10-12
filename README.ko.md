@@ -668,7 +668,7 @@ tokscale cursor logout --all --purge-cache
 
 로그아웃 시 Tokscale은 캐시된 사용량을 `cursor-cache/archive/`로 옮겨 더 이상 합산되지 않도록 합니다. 캐시된 사용량을 대신 삭제하려면 `--purge-cache`를 사용하세요.
 
-`tokscale cursor sync`는 저장된 각 계정의 사용량 기록을 페이지 단위로 내려받고, 계정마다 전체 시간 예산을 하나씩 적용합니다. 기본 예산은 120초에서 시작해 Cursor가 알려 주는 해당 계정의 사용량 이벤트 수에 맞춰 최대 1800초(30분)까지 늘어납니다. 고정된 예산을 쓰려면 한 번만 적용할 때는 `--timeout <SECONDS>`를 넘기고, 계속 적용하려면 `~/.config/tokscale/settings.json`에 `cursor.syncTimeoutSeconds`를 저장하세요. 둘 다 1-86400 범위의 값을 받습니다. 플래그가 설정보다 우선하고, 설정은 기본 예산보다 우선합니다.
+`tokscale cursor sync`는 저장된 각 계정의 사용량 기록을 페이지 단위로 내려받고, 계정마다 전체 시간 예산을 하나씩 적용합니다. 기본 예산은 120초에서 시작해 Cursor가 알려 주는 해당 계정의 사용량 이벤트 수에 맞춰 최대 1800초(30분)까지 늘어납니다. 고정된 예산을 쓰려면 한 번만 적용할 때는 `--timeout <SECONDS>`를 넘기고, 계속 적용하려면 `~/.config/tokscale/settings.json`(Windows: `%APPDATA%\tokscale\settings.json`)에 `cursor.syncTimeoutSeconds`를 저장하세요. 둘 다 1-86400 사이의 정수(초)를 받습니다. 설정에 그 밖의 값이 있으면 Tokscale이 경고를 출력하고 기본 예산을 씁니다. 플래그가 설정보다 우선하고, 설정은 기본 예산보다 우선합니다.
 
 ```json
 {
@@ -917,7 +917,7 @@ tokscale codex status --name personal --json
 
 ### 설정
 
-Tokscale은 설정을 `~/.config/tokscale/settings.json`에 저장합니다:
+Tokscale은 설정을 `~/.config/tokscale/settings.json`(Windows: `%APPDATA%\tokscale\settings.json`)에 저장합니다:
 
 ```json
 {
@@ -1844,7 +1844,7 @@ Hermes는 세션 수준 사용량을 SQLite `sessions` 테이블에 저장합니
 
 Senpi는 Pi와 같은 JSONL 세션 형식을 사용합니다. OmO는 태스크 하위 세션을 각 프로젝트 안에 저장하므로, Tokscale은 두 세션 트리의 세션 헤더에서 `cwd`를 읽고 `<project>/.omo/senpi-task/children/`가 있는 모든 프로젝트에서 이 디렉터리를 스캔합니다. OmO의 `task.state_dir`가 절대 경로로 설정되어 있으면(프로젝트의 `.omo/omo.jsonc` 또는 `.omo/omo.json`, 또는 `~/.omo/` 아래의 같은 파일) 대신 `<state_dir>/children/`를 스캔합니다.
 
-OmO 에이전트 디렉터리가 다른 곳에 있다면 `~/.config/tokscale/settings.json`의 `scanner.extraScanPaths.senpi`에 추가하세요. 항목은 에이전트 디렉터리나 그 안의 `sessions/` 디렉터리를 가리킬 수 있습니다. Tokscale은 그곳의 세션을 스캔하고, 세션에 기록된 프로젝트의 태스크 하위 세션도 같은 방식으로 찾습니다:
+OmO 에이전트 디렉터리가 다른 곳에 있다면 `~/.config/tokscale/settings.json`(Windows: `%APPDATA%\tokscale\settings.json`)의 `scanner.extraScanPaths.senpi`에 추가하세요. 항목은 에이전트 디렉터리나 그 안의 `sessions/` 디렉터리를 가리킬 수 있습니다. Tokscale은 그곳의 세션을 스캔하고, 세션에 기록된 프로젝트의 태스크 하위 세션도 같은 방식으로 찾습니다:
 
 ```json
 {
