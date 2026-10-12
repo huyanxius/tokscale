@@ -1017,22 +1017,22 @@ fn codex_archive_failure_warning(
     failures.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
-            .then_with(|| left.reason.cmp(&right.reason))
+            .then_with(|| left.reason().cmp(&right.reason()))
     });
     failures.dedup_by(|left, right| left.path == right.path);
     let decode_failures = failures
         .iter()
-        .filter(|failure| failure.reason == sessions::codex::CodexArchiveFailureReason::Decode)
+        .filter(|failure| failure.reason() == sessions::codex::CodexArchiveFailureReason::Decode)
         .count();
     let size_limit_failures = failures
         .iter()
         .filter(|failure| {
-            failure.reason == sessions::codex::CodexArchiveFailureReason::DecodedSizeLimit
+            failure.reason() == sessions::codex::CodexArchiveFailureReason::DecodedSizeLimit
         })
         .count();
     let open_failures = failures
         .iter()
-        .filter(|failure| failure.reason == sessions::codex::CodexArchiveFailureReason::Open)
+        .filter(|failure| failure.reason() == sessions::codex::CodexArchiveFailureReason::Open)
         .count();
     let mut categories = Vec::new();
     if decode_failures > 0 {
@@ -1058,11 +1058,17 @@ fn codex_archive_failure_warning(
     let examples = failures
         .iter()
         .take(2)
-        .map(|failure| format!("{:?}", failure.path))
+        .map(|failure| {
+            format!(
+                "{:?} ({})",
+                failure.path,
+                failure.cause_summary().escape_debug()
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
-        "Warning: skipped {total} unreadable compressed Codex rollout file{} ({}). Recorded token totals omit {}. Example{}: {examples}.",
+        "Warning: skipped {total} unreadable compressed Codex rollout file{} ({}). Recorded token totals may omit {}. Example{}: {examples}.",
         if total == 1 { "" } else { "s" },
         categories.join("; "),
         if total == 1 { "this file" } else { "these files" },
@@ -7700,6 +7706,28 @@ mod tests {
     }
 
     #[test]
+    fn codex_archive_warning_includes_tui_safe_underlying_cause() {
+        let warning =
+            super::codex_archive_failure_warning(vec![sessions::codex::CodexArchiveFailure::open(
+                std::path::Path::new("/tmp/permission.jsonl.zst"),
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "permission denied\nretry",
+                ),
+            )])
+            .unwrap();
+
+        assert!(warning.contains(
+            r#"/tmp/permission.jsonl.zst" (open failed: permission denied\nretry [PermissionDenied])"#
+        ));
+        assert_eq!(
+            warning.lines().count(),
+            1,
+            "the TUI warning must stay on one line"
+        );
+    }
+
+    #[test]
     #[serial]
     fn unreadable_codex_archives_warn_on_cached_and_local_scans() {
         let cache_home = tempfile::TempDir::new().unwrap();
@@ -7717,10 +7745,12 @@ mod tests {
         );
         let encoded = zstd::encode_all(content.as_bytes(), 0).unwrap();
         let good_path = sessions.join("good.jsonl.zst");
-        let corrupt_path = sessions.join("corrupt.jsonl.zst");
+        let corrupt_path = sessions.join("copy.jsonl.zst");
+        let plain_copy_path = sessions.join("copy.jsonl");
         let truncated_path = sessions.join("truncated.jsonl.zst");
         let capped_path = sessions.join("capped.jsonl.zst");
         std::fs::write(&good_path, &encoded).unwrap();
+        std::fs::write(&plain_copy_path, content).unwrap();
         std::fs::write(&corrupt_path, b"not a zstd stream").unwrap();
         let mut truncated = encoded.clone();
         truncated.pop();
@@ -7735,7 +7765,10 @@ mod tests {
             assert!(warning.contains("skipped 3 unreadable compressed Codex rollout files"));
             assert!(warning.contains("2 decode failures"));
             assert!(warning.contains("1 exceeded the 256 MiB decoded-size limit"));
-            assert!(warning.contains("Recorded token totals omit these files"));
+            assert!(warning.contains("Recorded token totals may omit these files"));
+            assert!(warning.contains("capped.jsonl.zst\" (decoded size limit exceeded"));
+            assert!(warning.contains("copy.jsonl.zst\" (decode failed"));
+            assert!(!warning.contains("truncated.jsonl.zst"));
             assert_eq!(
                 warning.matches(".jsonl.zst").count(),
                 2,
@@ -7744,8 +7777,14 @@ mod tests {
         };
 
         let cold = scan_cached();
-        assert_eq!(cold.len(), 1);
-        assert_eq!(cold[0].session_id, "good");
+        assert_eq!(cold.len(), 2);
+        assert_eq!(
+            cold.iter()
+                .map(|message| message.session_id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["copy", "good"]),
+            "the readable plain copy retains its usage while its archive is skipped"
+        );
         let warnings = take_codex_archive_warnings();
         assert_eq!(warnings.len(), 1);
         assert_warning(&warnings[0]);
@@ -7754,7 +7793,7 @@ mod tests {
         // while the TUI keeps only the latest aggregate instead of duplicates.
         for _ in 0..2 {
             let warm = scan_cached();
-            assert_eq!(warm.len(), 1);
+            assert_eq!(warm.len(), 2);
         }
         let warnings = take_codex_archive_warnings();
         assert_eq!(warnings.len(), 1);
@@ -7767,7 +7806,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        assert_eq!(direct.counts.get(ClientId::Codex), 1);
+        assert_eq!(direct.counts.get(ClientId::Codex), 2);
         let warnings = take_codex_archive_warnings();
         assert_eq!(warnings.len(), 1);
         assert_warning(&warnings[0]);
