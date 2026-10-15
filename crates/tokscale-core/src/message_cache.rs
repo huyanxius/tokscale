@@ -51,6 +51,9 @@ const CACHE_FORMAT_VERSION: u32 = 10;
 // version moves too because those entries also serialize UnifiedMessage, so
 // it stays one ahead of CACHE_FORMAT_VERSION as both move together.
 const MICODE_CACHE_FORMAT_VERSION: u32 = 11;
+// Copilot's payload includes per-row context alongside the unchanged entry.
+// Namespace discrimination keeps MiMo and all retained-history formats intact.
+const COPILOT_CACHE_FORMAT_VERSION: u32 = 12;
 const LEGACY_CACHE_FORMAT_VERSION_V4: u32 = 4;
 const LEGACY_CACHE_FORMAT_VERSION_V5: u32 = 5;
 const LEGACY_CACHE_FORMAT_VERSION_V6: u32 = 6;
@@ -1373,7 +1376,10 @@ fn parser_version(client: ClientId) -> u32 {
         // carry those sessions as zero-token.
         // v9->v10: scope OTEL line-ordinal fallback keys to their source file
         // before merging stable snapshots across files.
-        ClientId::Copilot => 10,
+        // v10->v11: also scope span-id-only OTEL records to their source file;
+        // unchanged v10 sources must not replay the old globally shared keys.
+        // v11->v12: retain missing-vs-populated attribution across rotations.
+        ClientId::Copilot => 12,
         // Devin CLI v1 could stop at a malformed chat_message. v2->v3:
         // message timestamp is now back-calculated to the turn start
         // (created_at - total_time_ms) instead of the recorded (end-anchored)
@@ -1831,6 +1837,7 @@ impl From<LegacyUnifiedMessageV7> for UnifiedMessage {
             dedup_key: message.dedup_key,
             session_title: message.session_title,
             parent_session_id: None,
+            copilot_context: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
         }
@@ -1916,6 +1923,7 @@ impl From<LegacyUnifiedMessageV8> for UnifiedMessage {
             dedup_key: message.dedup_key,
             session_title: message.session_title,
             parent_session_id: None,
+            copilot_context: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
         }
@@ -1999,6 +2007,7 @@ impl From<LegacyUnifiedMessageV9> for UnifiedMessage {
             dedup_key: message.dedup_key,
             session_title: message.session_title,
             parent_session_id: None,
+            copilot_context: None,
             is_turn_start: message.is_turn_start,
             model_attribution_conflicted: message.model_attribution_conflicted,
         }
@@ -3135,6 +3144,35 @@ fn read_shard_with_limit(
         return ShardReadStatus::Stale;
     }
 
+    if identity.namespace == ClientId::Copilot.as_str() {
+        if envelope.format_version != COPILOT_CACHE_FORMAT_VERSION {
+            return ShardReadStatus::Stale;
+        }
+        type CopilotWireEntry = (
+            CachedSourceEntry,
+            Vec<Option<crate::sessions::copilot::CopilotContextProvenance>>,
+        );
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<CopilotWireEntry>>(&envelope.payload)
+        {
+            Ok(entries) => {
+                let mut restored = Vec::with_capacity(entries.len());
+                for (mut entry, contexts) in entries {
+                    if entry.messages.len() != contexts.len() {
+                        return ShardReadStatus::Invalid("Copilot context length mismatch".into());
+                    }
+                    for (message, context) in entry.messages.iter_mut().zip(contexts) {
+                        message.copilot_context = context;
+                    }
+                    restored.push(entry);
+                }
+                ShardReadStatus::Loaded(restored)
+            }
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+
     if envelope.format_version == MICODE_CACHE_FORMAT_VERSION {
         if identity.namespace != ClientId::MiMoCode.as_str() {
             return ShardReadStatus::Stale;
@@ -3329,7 +3367,23 @@ fn write_shard_with_limit(
     max_shard_bytes: u64,
 ) -> std::io::Result<()> {
     let is_micode = identity.namespace == ClientId::MiMoCode.as_str();
-    let payload = if is_micode {
+    let is_copilot = identity.namespace == ClientId::Copilot.as_str();
+    let payload = if is_copilot {
+        let entries: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                let contexts: Vec<_> = entry
+                    .messages
+                    .iter()
+                    .map(|message| message.copilot_context)
+                    .collect();
+                (entry, contexts)
+            })
+            .collect();
+        bincode::options()
+            .with_limit(max_shard_bytes)
+            .serialize(&entries)
+    } else if is_micode {
         let entries: Vec<_> = entries
             .iter()
             .map(|entry| (entry, &entry.micode_metadata))
@@ -3344,7 +3398,9 @@ fn write_shard_with_limit(
     }
     .map_err(std::io::Error::other)?;
     let envelope = CachedShardEnvelope {
-        format_version: if is_micode {
+        format_version: if is_copilot {
+            COPILOT_CACHE_FORMAT_VERSION
+        } else if is_micode {
             MICODE_CACHE_FORMAT_VERSION
         } else {
             CACHE_FORMAT_VERSION
@@ -4612,7 +4668,7 @@ mod tests {
         let cache = SourceMessageCache::load();
         for path in &paths {
             let entry = cache.get(identity, path).unwrap();
-            assert_eq!(entry.parser_version, 10);
+            assert_eq!(entry.parser_version, 12);
             assert!(entry.messages[0]
                 .dedup_key
                 .as_ref()
@@ -4627,8 +4683,166 @@ mod tests {
     }
 
     #[test]
-    fn test_copilot_file_scoped_keys_parser_version_invalidates_v9_entries() {
-        assert_eq!(parser_version(ClientId::Copilot), 10);
+    #[serial_test::serial]
+    fn copilot_rebuilds_span_only_keys_in_unchanged_v10_sources() {
+        for operation in ["chat", "invoke_agent"] {
+            let home = TempDir::new().unwrap();
+            let _env = sandbox_cache_env(home.path());
+            let otel = home.path().join(".copilot/otel");
+            fs::create_dir_all(&otel).unwrap();
+            let identity = CacheIdentity::for_client(ClientId::Copilot);
+            let predecessor = CacheIdentity {
+                namespace: identity.namespace,
+                parser_version: 10,
+            };
+            let paths = [otel.join("a.jsonl"), otel.join("b.jsonl")];
+            let mut shards: HashMap<_, Vec<_>> = HashMap::new();
+            for (path, input) in paths.iter().zip([100, 200]) {
+                let record = serde_json::json!({
+                    "type": "span", "spanId": "same-span", "name": operation,
+                    "startTime": [1775934260i64, 0],
+                    "attributes": {"gen_ai.operation.name": operation, "gen_ai.response.model": "gpt-4o",
+                        "gen_ai.conversation.id": "session", "gen_ai.usage.input_tokens": input}
+                });
+                fs::write(path, record.to_string()).unwrap();
+                let fingerprint = SourceFingerprint::from_path(path).unwrap();
+                let mut legacy = crate::sessions::copilot::parse_copilot_file(path);
+                assert_eq!(legacy.len(), 1);
+                legacy[0].dedup_key = Some("span:session:same-span".to_string());
+                let entry = CachedSourceEntry::new(
+                    predecessor,
+                    path,
+                    fingerprint,
+                    legacy,
+                    Vec::new(),
+                    None,
+                );
+                shards
+                    .entry(cache_shard_path(identity, path))
+                    .or_default()
+                    .push(entry);
+            }
+            for (shard, entries) in shards {
+                ensure_cache_dir(shard.parent().unwrap()).unwrap();
+                write_shard_with_limit(&shard, predecessor, &entries, MAX_CACHE_SHARD_BYTES)
+                    .unwrap();
+            }
+            let scan = || {
+                crate::parse_all_messages_with_pricing_with_env_strategy(
+                    home.path().to_str().unwrap(),
+                    &["copilot".to_string()],
+                    None,
+                    false,
+                    &crate::scanner::ScannerSettings::default(),
+                )
+            };
+            let rebuilt = scan();
+            assert_eq!(rebuilt.len(), 2, "{operation}");
+            assert_eq!(
+                rebuilt.iter().map(|m| m.tokens.input).sum::<i64>(),
+                300,
+                "{operation}"
+            );
+            assert_ne!(rebuilt[0].dedup_key, rebuilt[1].dedup_key);
+            let cache = SourceMessageCache::load();
+            for path in &paths {
+                let entry = cache.get(identity, path).unwrap();
+                assert_eq!(entry.parser_version, 12);
+                assert!(entry.messages[0]
+                    .dedup_key
+                    .as_ref()
+                    .unwrap()
+                    .starts_with("file:"));
+                assert!(matches!(
+                    SourceFingerprint::check_path_samples_only(path, Some(&entry.fingerprint)),
+                    Some(FingerprintStatus::Unchanged)
+                ));
+            }
+            assert_eq!(scan(), rebuilt, "{operation}");
+        }
+    }
+
+    #[test]
+    fn copilot_provenance_does_not_change_generic_message_wire_bytes() {
+        use crate::sessions::copilot::{ContextOrigin, CopilotContextProvenance};
+        let mut message = UnifiedMessage::new_with_dedup(
+            "claude",
+            "model",
+            "provider",
+            "session",
+            0,
+            crate::TokenBreakdown::default(),
+            0.0,
+            None,
+        );
+        let before = bincode::options().serialize(&message).unwrap();
+        message.copilot_context = Some(CopilotContextProvenance {
+            model: ContextOrigin::Missing,
+            session: ContextOrigin::Trace,
+            agent: ContextOrigin::Record,
+        });
+        assert_eq!(bincode::options().serialize(&message).unwrap(), before);
+        let restored: UnifiedMessage = bincode::options().deserialize(&before).unwrap();
+        assert!(restored.copilot_context.is_none());
+    }
+
+    #[test]
+    fn copilot_context_cache_round_trip_and_legacy_rejection() {
+        use crate::sessions::copilot::{ContextOrigin, CopilotContextProvenance};
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.jsonl");
+        fs::write(&source, "{}").unwrap();
+        let path = dir.path().join("shard.bin");
+        let identity = CacheIdentity::for_client(ClientId::Copilot);
+        let mut entry = test_entry(identity, &source, "context-session");
+        entry.messages[0].copilot_context = Some(CopilotContextProvenance {
+            model: ContextOrigin::Missing,
+            session: ContextOrigin::Trace,
+            agent: ContextOrigin::Record,
+        });
+        write_shard_with_limit(&path, identity, &[entry.clone()], MAX_CACHE_SHARD_BYTES).unwrap();
+        let ShardReadStatus::Loaded(restored) = read_shard(&path, identity) else {
+            panic!("expected Copilot envelope");
+        };
+        assert_eq!(restored[0].messages, entry.messages);
+
+        // A real pre-provenance payload has the unchanged generic entry layout.
+        // It must be rejected, even if a header accidentally claims parser v12.
+        for version in [11, identity.parser_version] {
+            let envelope = CachedShardEnvelope {
+                format_version: CACHE_FORMAT_VERSION,
+                parser_namespace: identity.namespace.to_string(),
+                parser_version: version,
+                payload: bincode::options().serialize(&vec![entry.clone()]).unwrap(),
+            };
+            fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
+            assert!(matches!(
+                read_shard(&path, identity),
+                ShardReadStatus::Stale
+            ));
+        }
+        // A mismatched parallel vector must never pair context with wrong rows.
+        let envelope = CachedShardEnvelope {
+            format_version: COPILOT_CACHE_FORMAT_VERSION,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options()
+                .serialize(&vec![(
+                    entry,
+                    Vec::<Option<CopilotContextProvenance>>::new(),
+                )])
+                .unwrap(),
+        };
+        fs::write(&path, bincode::options().serialize(&envelope).unwrap()).unwrap();
+        assert!(matches!(
+            read_shard(&path, identity),
+            ShardReadStatus::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn test_copilot_context_parser_version_invalidates_pre_v12_entries() {
+        assert_eq!(parser_version(ClientId::Copilot), 12);
     }
 
     #[test]

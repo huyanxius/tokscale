@@ -107,6 +107,27 @@ struct TraceContext {
     agent_id: Option<String>,
 }
 
+/// Whether an attribution was observed or merely a display fallback. Provider
+/// is inferred from model, so it has the model's provenance. Trace enrichment
+/// is populated evidence too; it must not override a conflicting record.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum ContextOrigin {
+    Missing,
+    Trace,
+    Record,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct CopilotContextProvenance {
+    pub model: ContextOrigin,
+    pub session: ContextOrigin,
+    pub agent: ContextOrigin,
+}
+
 struct CopilotUsageCandidate {
     source: CopilotUsageSource,
     trace_id: Option<String>,
@@ -123,6 +144,7 @@ struct CopilotUsageCandidate {
     dedup_key: String,
     agent: Option<String>,
     agent_is_direct: bool,
+    context: CopilotContextProvenance,
 }
 
 /// A usage record as read off the file, with everything that depends on the
@@ -167,6 +189,29 @@ impl PendingUsageCandidate {
             .as_deref()
             .and_then(|trace_id| trace_contexts.get(trace_id));
 
+        let origin = |direct: bool, inherited: bool| {
+            if direct {
+                ContextOrigin::Record
+            } else if inherited {
+                ContextOrigin::Trace
+            } else {
+                ContextOrigin::Missing
+            }
+        };
+        let context = CopilotContextProvenance {
+            model: origin(
+                self.model.is_some(),
+                trace_context.is_some_and(|c| c.model.is_some()),
+            ),
+            session: origin(
+                self.session_id.is_some(),
+                trace_context.is_some_and(|c| c.session_id.is_some()),
+            ),
+            agent: origin(
+                self.agent.is_some(),
+                trace_context.is_some_and(|c| c.agent_id.is_some()),
+            ),
+        };
         let model = self
             .model
             .or_else(|| trace_context.and_then(|context| context.model.clone()))
@@ -188,14 +233,13 @@ impl PendingUsageCandidate {
             self.timestamp_ms,
             self.index,
         );
-        // Line ordinals identify records only inside this source file. Keep
-        // stable span/turn keys unchanged, but do not let equal fallback keys
-        // in different exports masquerade as snapshots of the same request.
+        // A span is globally identified by its trace ID AND span ID. Bare
+        // span IDs and line ordinals are only stable within this source file;
+        // equal sparse identities in different exports may be separate calls.
         let globally_stable = match self.source {
-            CopilotUsageSource::ChatSpan | CopilotUsageSource::AgentSummarySpan => {
-                self.span_id.is_some()
-            }
-            CopilotUsageSource::InferenceLog => self.trace_id.is_some() && self.span_id.is_some(),
+            CopilotUsageSource::ChatSpan
+            | CopilotUsageSource::AgentSummarySpan
+            | CopilotUsageSource::InferenceLog => self.trace_id.is_some() && self.span_id.is_some(),
             CopilotUsageSource::AgentTurnLog => {
                 self.trace_id.is_some() && self.turn_index.is_some()
             }
@@ -231,6 +275,7 @@ impl PendingUsageCandidate {
             dedup_key,
             agent,
             agent_is_direct,
+            context,
         }
     }
 }
@@ -257,6 +302,7 @@ impl CopilotUsageCandidate {
         );
         message.duration_ms = self.duration_ms;
         message.agent = self.agent;
+        message.copilot_context = Some(self.context);
         message
     }
 
@@ -306,6 +352,7 @@ impl CopilotUsageCandidate {
         if replace_agent {
             self.agent = duplicate_agent;
             self.agent_is_direct = duplicate.agent_is_direct;
+            self.context.agent = duplicate.context.agent;
         }
     }
 }
@@ -889,29 +936,162 @@ fn file_scope(path: &Path) -> String {
     )
 }
 
+fn context_present(message: &UnifiedMessage) -> (bool, bool, bool) {
+    message.copilot_context.map_or((true, true, true), |c| {
+        (
+            c.model != ContextOrigin::Missing,
+            c.session != ContextOrigin::Missing,
+            c.agent != ContextOrigin::Missing,
+        )
+    })
+}
+
+fn compatible_context(a: &UnifiedMessage, b: &UnifiedMessage) -> bool {
+    let (am, as_, aa) = context_present(a);
+    let (bm, bs, ba) = context_present(b);
+    (!am || !bm || (a.model_id == b.model_id && a.provider_id == b.provider_id))
+        && (!as_ || !bs || a.session_id == b.session_id)
+        && (!aa || !ba || a.agent == b.agent)
+        && a.timestamp == b.timestamp
+}
+
+fn same_context(a: &UnifiedMessage, b: &UnifiedMessage) -> bool {
+    context_present(a) == context_present(b)
+        && a.model_id == b.model_id
+        && a.provider_id == b.provider_id
+        && a.session_id == b.session_id
+        && a.agent == b.agent
+        && a.timestamp == b.timestamp
+}
+
+/// Missing fields are wildcards, not evidence that two conflicting owners
+/// are the same request. Determine ambiguity from the original snapshots,
+/// before any enrichment can conceal one of those possible owners.
+fn ambiguous_contexts(messages: &[UnifiedMessage]) -> Vec<bool> {
+    let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        if let Some(key) = message.dedup_key.as_deref() {
+            groups.entry(key).or_default().push(index);
+        }
+    }
+    let mut ambiguous = vec![false; messages.len()];
+    for indices in groups.values().filter(|indices| indices.len() > 1) {
+        for &index in indices {
+            let mut models = HashSet::new();
+            let mut sessions = HashSet::new();
+            let mut agents = HashSet::new();
+            for &other in indices {
+                let candidate = &messages[other];
+                if !compatible_context(&messages[index], candidate) {
+                    continue;
+                }
+                let (model, session, agent) = context_present(candidate);
+                if model {
+                    models.insert((&candidate.model_id, &candidate.provider_id));
+                }
+                if session {
+                    sessions.insert(&candidate.session_id);
+                }
+                if agent {
+                    agents.insert(&candidate.agent);
+                }
+                if models.len() > 1 || sessions.len() > 1 || agents.len() > 1 {
+                    ambiguous[index] = true;
+                    break;
+                }
+            }
+        }
+    }
+    ambiguous
+}
+
+fn enrich_context(existing: &mut UnifiedMessage, other: &UnifiedMessage) {
+    let (model, session, agent) = context_present(existing);
+    let (other_model, other_session, other_agent) = context_present(other);
+    if !model && other_model {
+        existing.model_id.clone_from(&other.model_id);
+        existing.provider_id.clone_from(&other.provider_id);
+    }
+    if !session && other_session {
+        existing.session_id.clone_from(&other.session_id);
+    }
+    if !agent && other_agent {
+        existing.agent.clone_from(&other.agent);
+    }
+    if let Some(context) = &mut existing.copilot_context {
+        // Unknown provenance is conservatively populated. Never turn an
+        // adopted legacy value back into a wildcard on a subsequent merge.
+        let other = other.copilot_context.unwrap_or(CopilotContextProvenance {
+            model: ContextOrigin::Record,
+            session: ContextOrigin::Record,
+            agent: ContextOrigin::Record,
+        });
+        context.model = context.model.max(other.model);
+        context.session = context.session.max(other.session);
+        context.agent = context.agent.max(other.agent);
+    }
+}
+
+fn compare_messages(a: &UnifiedMessage, b: &UnifiedMessage) -> std::cmp::Ordering {
+    let richness = |m: &UnifiedMessage| {
+        let (model, session, agent) = context_present(m);
+        u8::from(model) + u8::from(session) + u8::from(agent)
+    };
+    a.dedup_key
+        .cmp(&b.dedup_key)
+        .then_with(|| richness(b).cmp(&richness(a)))
+        .then_with(|| context_present(a).cmp(&context_present(b)))
+        .then_with(|| a.copilot_context.cmp(&b.copilot_context))
+        .then_with(|| {
+            (
+                &a.model_id,
+                &a.provider_id,
+                &a.session_id,
+                &a.agent,
+                a.timestamp,
+            )
+                .cmp(&(
+                    &b.model_id,
+                    &b.provider_id,
+                    &b.session_id,
+                    &b.agent,
+                    b.timestamp,
+                ))
+        })
+}
+
 /// Merge cached or freshly parsed snapshots across OTEL files. A stable key
-/// alone does not retain the parser's timing/attribution provenance, so keep
-/// conflicting attribution or timestamps separate instead of choosing one.
+/// uses explicit provenance to fill missing attribution while retaining
+/// conflicting populated attribution or timestamps instead of choosing one.
 /// Per-file candidate merging still owns richer partial-boundary handling.
-pub(crate) fn merge_copilot_messages(messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
+pub(crate) fn merge_copilot_messages(mut messages: Vec<UnifiedMessage>) -> Vec<UnifiedMessage> {
+    // Canonical ordering makes both attribution and output independent of
+    // file enumeration. Missingness participates even when display fallback
+    // strings happen to equal an explicitly recorded value.
+    messages.sort_by(compare_messages);
+    let ambiguous = ambiguous_contexts(&messages);
     let mut merged: Vec<UnifiedMessage> = Vec::with_capacity(messages.len());
+    let mut merged_ambiguous = Vec::with_capacity(messages.len());
     let mut indexes: HashMap<String, Vec<usize>> = HashMap::new();
-    for message in messages {
+    for (message, ambiguous) in messages.into_iter().zip(ambiguous) {
         let Some(key) = message.dedup_key.as_ref() else {
             merged.push(message);
+            merged_ambiguous.push(ambiguous);
             continue;
         };
         let candidates = indexes.entry(key.clone()).or_default();
-        let matching = candidates.iter().copied().find(|&index| {
-            let existing = &merged[index];
-            existing.model_id == message.model_id
-                && existing.provider_id == message.provider_id
-                && existing.session_id == message.session_id
-                && existing.agent == message.agent
-                && existing.timestamp == message.timestamp
+        let mut matching = candidates.iter().copied().filter(|&index| {
+            if ambiguous || merged_ambiguous[index] {
+                same_context(&merged[index], &message)
+            } else {
+                compatible_context(&merged[index], &message)
+            }
         });
-        if let Some(index) = matching {
+        let first = matching.next();
+        let unique_match = first.filter(|_| matching.next().is_none());
+        if let Some(index) = unique_match {
             let existing = &mut merged[index];
+            enrich_context(existing, &message);
             // normalize_input_tokens stores max(input - cache_read, 0).
             // Adding cache_read recovers max(inclusive_input, cache_read).
             // Taking both maxima and subtracting the merged cache_read is
@@ -942,8 +1122,11 @@ pub(crate) fn merge_copilot_messages(messages: Vec<UnifiedMessage>) -> Vec<Unifi
         } else {
             candidates.push(merged.len());
             merged.push(message);
+            merged_ambiguous.push(ambiguous);
         }
     }
+    // Enrichment may change the sort fields, so canonicalize the result too.
+    merged.sort_by(compare_messages);
     merged
 }
 
@@ -960,9 +1143,9 @@ fn dedup_key(
         CopilotUsageSource::ChatSpan | CopilotUsageSource::AgentSummarySpan => {
             match (trace_id, span_id) {
                 (Some(trace_id), Some(span_id)) => format!("{trace_id}:{span_id}"),
-                // No trace id, but a valid span id is still a stable identity
-                // (unlike the line-index fallback below): key on it directly
-                // so duplicate span-id-only snapshots collapse to one entry.
+                // Preserve span-id-only snapshot merging within a file.
+                // `resolve` scopes this key to its source file because a bare
+                // span ID does not identify a request across exports.
                 (None, Some(span_id)) => format!("span:{session_id}:{span_id}"),
                 _ => format!("span:{session_id}:{timestamp_ms}:{index}"),
             }
@@ -1187,6 +1370,188 @@ mod tests {
         )
     }
 
+    fn context_snapshot(
+        model: Option<&str>,
+        session: Option<&str>,
+        agent: Option<&str>,
+    ) -> UnifiedMessage {
+        let mut attrs =
+            serde_json::json!({"gen_ai.operation.name":"chat", "gen_ai.usage.input_tokens":100});
+        for (key, value) in [
+            ("gen_ai.response.model", model),
+            ("gen_ai.conversation.id", session),
+            ("gen_ai.agent.id", agent),
+        ] {
+            if let Some(value) = value {
+                attrs[key] = value.into();
+            }
+        }
+        let file = create_test_file(
+            &serde_json::json!({
+                "type":"span", "traceId":"trace", "spanId":"span", "name":"chat",
+                "startTime":[1775934260i64,0], "attributes": attrs
+            })
+            .to_string(),
+        );
+        parse_copilot_file(file.path()).pop().unwrap()
+    }
+
+    #[test]
+    fn rotation_context_fills_only_missing_values_in_either_order() {
+        let rich = context_snapshot(Some("gpt-4o"), Some("session"), Some("agent"));
+        for sparse in [
+            context_snapshot(None, None, None),
+            context_snapshot(None, Some("session"), Some("agent")),
+            context_snapshot(Some("gpt-4o"), None, Some("agent")),
+            context_snapshot(Some("gpt-4o"), Some("session"), None),
+        ] {
+            for rows in [
+                vec![sparse.clone(), rich.clone()],
+                vec![rich.clone(), sparse.clone()],
+            ] {
+                let merged = merge_copilot_messages(rows);
+                assert_eq!(merged, vec![rich.clone()]);
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_context_preserves_populated_conflicts_even_fallback_lookalikes() {
+        let rich = context_snapshot(Some("gpt-4o"), Some("session"), Some("agent"));
+        for conflicting in [
+            context_snapshot(Some("unknown"), Some("session"), Some("agent")),
+            context_snapshot(Some("gpt-4o"), Some("trace"), Some("agent")),
+            context_snapshot(Some("gpt-4o"), Some("session"), Some("different")),
+        ] {
+            for rows in [
+                vec![rich.clone(), conflicting.clone()],
+                vec![conflicting.clone(), rich.clone()],
+            ] {
+                assert_eq!(merge_copilot_messages(rows).len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_missing_context_does_not_bridge_two_populated_conflicts() {
+        let a = context_snapshot(Some("gpt-4o"), Some("session"), Some("agent"));
+        let b = context_snapshot(Some("claude-sonnet-4"), Some("session"), Some("agent"));
+        let sparse = context_snapshot(None, None, None);
+        let expected = merge_copilot_messages(vec![a.clone(), b.clone(), sparse.clone()]);
+        for rows in [
+            vec![sparse.clone(), a.clone(), b.clone()],
+            vec![b.clone(), sparse.clone(), a.clone()],
+            vec![b, a, sparse],
+        ] {
+            assert_eq!(merge_copilot_messages(rows), expected);
+        }
+        assert_eq!(
+            expected.len(),
+            3,
+            "ambiguous missing attribution must not choose a conflicting owner"
+        );
+        let mut repeated = expected.clone();
+        repeated.extend(expected.clone());
+        assert_eq!(merge_copilot_messages(repeated), expected);
+    }
+
+    #[test]
+    fn rotation_disjoint_context_does_not_choose_an_ambiguous_agent() {
+        let model = context_snapshot(Some("gpt-4o"), None, None);
+        let agent_a = context_snapshot(None, None, Some("agent-a"));
+        let agent_b = context_snapshot(None, None, Some("agent-b"));
+        for rows in [
+            vec![model.clone(), agent_a.clone(), agent_b.clone()],
+            vec![agent_b, model, agent_a],
+        ] {
+            let result = merge_copilot_messages(rows);
+            assert_eq!(
+                result.len(),
+                3,
+                "a model-only row is compatible with both conflicting agents"
+            );
+            assert_eq!(result.iter().filter(|m| m.agent.is_none()).count(), 1);
+        }
+    }
+
+    #[test]
+    fn rotation_ambiguous_existing_group_is_not_enriched_later() {
+        let rows = vec![
+            context_snapshot(None, None, Some("agent-a")),
+            context_snapshot(None, None, Some("agent-b")),
+            context_snapshot(None, Some("session-a"), Some("agent-a")),
+            context_snapshot(Some("gpt-4o"), Some("session-a"), None),
+        ];
+        let merged = merge_copilot_messages(rows.clone());
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merge_copilot_messages(merged.clone()), merged);
+        let mut repeated = merged.clone();
+        repeated.extend(rows);
+        assert_eq!(merge_copilot_messages(repeated), merged);
+    }
+
+    #[test]
+    fn rotation_context_merge_is_idempotent_across_partial_attribution_profiles() {
+        let mut profiles = Vec::new();
+        for model in 0..3 {
+            for session in 0..3 {
+                for agent in 0..3 {
+                    let mut row = snapshot_message(100, 0);
+                    row.model_id = format!("model-{model}");
+                    row.session_id = format!("session-{session}");
+                    row.agent = (agent != 0).then(|| format!("agent-{agent}"));
+                    let origin = |value| {
+                        if value == 0 {
+                            ContextOrigin::Missing
+                        } else {
+                            ContextOrigin::Record
+                        }
+                    };
+                    row.copilot_context = Some(CopilotContextProvenance {
+                        model: origin(model),
+                        session: origin(session),
+                        agent: origin(agent),
+                    });
+                    profiles.push(row);
+                }
+            }
+        }
+        for a in 0..profiles.len() {
+            for b in a + 1..profiles.len() {
+                for c in b + 1..profiles.len() {
+                    for d in c + 1..profiles.len() {
+                        let rows = vec![
+                            profiles[a].clone(),
+                            profiles[b].clone(),
+                            profiles[c].clone(),
+                            profiles[d].clone(),
+                        ];
+                        let merged = merge_copilot_messages(rows.clone());
+                        let mut reverse = rows.clone();
+                        reverse.reverse();
+                        assert_eq!(
+                            merge_copilot_messages(reverse),
+                            merged,
+                            "permutation {a}/{b}/{c}/{d}"
+                        );
+                        assert_eq!(
+                            merge_copilot_messages(merged.clone()),
+                            merged,
+                            "idempotence {a}/{b}/{c}/{d}"
+                        );
+                        let mut repeated = rows.clone();
+                        repeated.extend(rows);
+                        assert_eq!(
+                            merge_copilot_messages(repeated),
+                            merged,
+                            "duplicate snapshots {a}/{b}/{c}/{d}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn cross_file_copilot_normalized_merge_matches_inclusive_input_maxima() {
         // Include over-reported cache reads and the i64 boundary. Testing
@@ -1268,19 +1633,17 @@ mod tests {
         changed.timestamp += 1000;
         variants.push(changed);
         for changed in variants {
-            assert_eq!(
-                merge_copilot_messages(vec![original.clone(), changed.clone()]),
-                vec![original.clone(), changed.clone()]
-            );
-            assert_eq!(
-                merge_copilot_messages(vec![changed.clone(), original.clone()]),
-                vec![changed, original.clone()]
-            );
+            let forward = merge_copilot_messages(vec![original.clone(), changed.clone()]);
+            let reverse = merge_copilot_messages(vec![changed.clone(), original.clone()]);
+            assert_eq!(forward, reverse);
+            assert_eq!(forward.len(), 2);
+            assert!(forward.contains(&original));
+            assert!(forward.contains(&changed));
         }
     }
 
     #[test]
-    fn cross_file_copilot_scopes_only_line_ordinal_fallbacks() {
+    fn cross_file_copilot_scopes_incomplete_identities() {
         let span = serde_json::json!({
             "type": "span", "name": "chat gpt-4o", "startTime": [1775934260i64, 0],
             "attributes": {"gen_ai.operation.name": "chat", "gen_ai.response.model": "gpt-4o", "gen_ai.conversation.id": "session", "gen_ai.usage.input_tokens": 10}
@@ -1309,7 +1672,7 @@ mod tests {
         for (record, expected_count) in [
             (span, 2),
             (zero_span, 2),
-            (stable_span, 1),
+            (stable_span, 2),
             (anonymous_turn, 2),
             (turn, 1),
             (untraced_turn, 2),
@@ -1327,6 +1690,24 @@ mod tests {
                 expected_count,
                 "{record}"
             );
+        }
+    }
+
+    #[test]
+    fn span_id_only_snapshots_still_merge_within_the_same_file() {
+        for operation in ["chat", "invoke_agent"] {
+            let record = |input| {
+                serde_json::json!({
+                    "type": "span", "name": operation, "spanId": "same-span",
+                    "startTime": [1775934260i64, 0],
+                    "attributes": {"gen_ai.operation.name": operation, "gen_ai.response.model": "gpt-4o",
+                        "gen_ai.conversation.id": "session", "gen_ai.usage.input_tokens": input}
+                })
+            };
+            let file = create_test_file(&format!("{}\n{}\n", record(100), record(200)));
+            let messages = parse_copilot_file(file.path());
+            assert_eq!(messages.len(), 1, "{operation}");
+            assert_eq!(messages[0].tokens.input, 200, "{operation}");
         }
     }
 
@@ -2183,6 +2564,11 @@ mod tests {
             dedup_key: "same-key".to_string(),
             agent: Some("fallback-agent".to_string()),
             agent_is_direct: false,
+            context: CopilotContextProvenance {
+                model: ContextOrigin::Record,
+                session: ContextOrigin::Record,
+                agent: ContextOrigin::Missing,
+            },
         };
         let duplicate = CopilotUsageCandidate {
             source: CopilotUsageSource::AgentSummarySpan,
@@ -2207,6 +2593,11 @@ mod tests {
             dedup_key: "same-key".to_string(),
             agent: Some("recovered-agent".to_string()),
             agent_is_direct: true,
+            context: CopilotContextProvenance {
+                model: ContextOrigin::Record,
+                session: ContextOrigin::Record,
+                agent: ContextOrigin::Record,
+            },
         };
 
         let merged = merge_duplicate_candidates(vec![primary, duplicate]);

@@ -1759,6 +1759,10 @@ $env:COPILOT_OTEL_FILE_EXPORTER_PATH = Join-Path $otelDir ("copilot-otel-{0}.jso
 
 Using a timestamped filename is recommended so each Copilot session writes to a fresh file instead of accumulating into one huge OTEL log.
 
+Repeated OTEL span snapshots are merged across files only when they carry a complete trace/span identity and compatible attribution and timestamps. Missing model, session, or agent context is filled from a matching richer snapshot; conflicting populated values remain separate. Records with a span ID but no trace ID can still merge within one file; they remain separate across files. The local parser cache is rebuilt when the parser generation changes.
+
+This local deduplication does not immediately lower already-uploaded historical totals. The hosted high-water policy retains the previous maximum until corrected usage exceeds it: incoming totals of `200 → 100 → 150 → 200 → 250` retain hosted totals of `200 → 200 → 200 → 200 → 250`. Later growth is still counted; repairing previously inflated hosted days requires a separate safe historical-correction mechanism. The local cache parser generation is independent of the submission wire generation, which is unchanged by this fix.
+
 Tokscale treats `chat` spans as the source of truth for token accounting and ignores tool spans plus cumulative metrics in phase 1:
 
 ```json

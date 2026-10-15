@@ -6917,6 +6917,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         parent_session_id: None,
         is_turn_start: false,
         model_attribution_conflicted: false,
+        copilot_context: None,
     }
 }
 
@@ -6997,6 +6998,67 @@ mod tests {
         assert_eq!(daily[0].totals.tokens, 146);
         assert_eq!(daily[0].token_breakdown.input, 120);
         assert_eq!(daily[0].token_breakdown.output, 26);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_rotation_missing_context_merges_in_all_lanes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let otel = source_home.path().join(".copilot/otel");
+        std::fs::create_dir_all(&otel).unwrap();
+        let usage = serde_json::json!({
+            "type": "span", "traceId": "rotation-trace", "spanId": "chat-span",
+            "name": "chat", "startTime": [1775934260i64, 0],
+            "attributes": {"gen_ai.operation.name": "chat",
+                "gen_ai.usage.input_tokens": 100, "gen_ai.usage.output_tokens": 20}
+        })
+        .to_string();
+        let context = serde_json::json!({
+            "type": "span", "traceId": "rotation-trace", "spanId": "invoke-span",
+            "name": "invoke_agent", "attributes": {
+                "gen_ai.operation.name": "invoke_agent", "gen_ai.request.model": "gpt-4o",
+                "gen_ai.conversation.id": "real-session", "gen_ai.agent.id": "root-agent"}
+        })
+        .to_string();
+        let rich = format!("{usage}\n{context}\n");
+        let clients = ["copilot".to_string()];
+        for (a, b) in [(&usage, &rich), (&rich, &usage)] {
+            std::fs::write(otel.join("a.jsonl"), a).unwrap();
+            std::fs::write(otel.join("b.jsonl"), b).unwrap();
+            for _ in 0..2 {
+                let messages = parse_all_messages_with_pricing_with_env_strategy(
+                    source_home.path().to_str().unwrap(),
+                    &clients,
+                    None,
+                    false,
+                    &scanner::ScannerSettings::default(),
+                );
+                assert_eq!(
+                    messages.len(),
+                    1,
+                    "cold and warm rotation snapshots must coalesce"
+                );
+                assert_eq!(messages[0].model_id, "gpt-4o");
+                assert_eq!(messages[0].provider_id, "openai");
+                assert_eq!(messages[0].session_id, "real-session");
+                assert_eq!(messages[0].agent.as_deref(), Some("root-agent"));
+                assert_eq!(messages[0].tokens.input, 100);
+            }
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(clients.to_vec()),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(parsed.messages[0].input, 100);
+        }
     }
 
     #[test]
@@ -7104,6 +7166,182 @@ mod tests {
             assert_eq!(parsed.messages.len(), 1);
             assert_eq!(parsed.messages[0].input, 500);
             assert_eq!(parsed.messages[0].output, 20);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn copilot_cross_file_span_identity_requires_trace_and_span_in_both_lanes() {
+        for operation in ["chat", "invoke_agent"] {
+            for (case, trace_a, span_a, trace_b, span_b, nested, expected_rows) in [
+                (
+                    "missing trace",
+                    None,
+                    Some("span"),
+                    None,
+                    Some("span"),
+                    false,
+                    2,
+                ),
+                (
+                    "empty trace",
+                    Some(""),
+                    Some("span"),
+                    Some(""),
+                    Some("span"),
+                    false,
+                    2,
+                ),
+                (
+                    "zero trace",
+                    Some("00000000000000000000000000000000"),
+                    Some("span"),
+                    Some("00000000000000000000000000000000"),
+                    Some("span"),
+                    false,
+                    2,
+                ),
+                (
+                    "nested span only",
+                    None,
+                    Some("span"),
+                    None,
+                    Some("span"),
+                    true,
+                    2,
+                ),
+                (
+                    "complete identity",
+                    Some("trace"),
+                    Some("span"),
+                    Some("trace"),
+                    Some("span"),
+                    false,
+                    1,
+                ),
+                (
+                    "nested complete identity",
+                    Some("trace"),
+                    Some("span"),
+                    Some("trace"),
+                    Some("span"),
+                    true,
+                    1,
+                ),
+                (
+                    "different traces",
+                    Some("trace-a"),
+                    Some("span"),
+                    Some("trace-b"),
+                    Some("span"),
+                    false,
+                    2,
+                ),
+                (
+                    "different spans",
+                    Some("trace"),
+                    Some("span-a"),
+                    Some("trace"),
+                    Some("span-b"),
+                    false,
+                    2,
+                ),
+                (
+                    "missing span",
+                    Some("trace"),
+                    None,
+                    Some("trace"),
+                    None,
+                    false,
+                    2,
+                ),
+                (
+                    "empty span",
+                    Some("trace"),
+                    Some(""),
+                    Some("trace"),
+                    Some(""),
+                    false,
+                    2,
+                ),
+                (
+                    "zero span",
+                    Some("trace"),
+                    Some("0000000000000000"),
+                    Some("trace"),
+                    Some("0000000000000000"),
+                    false,
+                    2,
+                ),
+            ] {
+                let cache_home = tempfile::TempDir::new().unwrap();
+                let source_home = tempfile::TempDir::new().unwrap();
+                let _cache_env = redirect_cache_home(cache_home.path());
+                let otel = source_home.path().join(".copilot/otel");
+                std::fs::create_dir_all(&otel).unwrap();
+                let record = |trace: Option<&str>, span: Option<&str>, input| {
+                    let mut record = serde_json::json!({
+                        "type": "span", "name": operation, "startTime": [1775934260i64, 0],
+                        "attributes": {"gen_ai.operation.name": operation, "gen_ai.response.model": "gpt-4o",
+                            "gen_ai.conversation.id": "same-session", "gen_ai.usage.input_tokens": input}
+                    });
+                    let mut context = serde_json::Map::new();
+                    if let Some(trace) = trace {
+                        context.insert("traceId".into(), trace.into());
+                    }
+                    if let Some(span) = span {
+                        context.insert("spanId".into(), span.into());
+                    }
+                    if nested {
+                        // Empty top-level sentinels must not mask valid nested IDs.
+                        record["traceId"] = "00000000000000000000000000000000".into();
+                        record["spanId"] = "0000000000000000".into();
+                        record["spanContext"] = context.into();
+                    } else {
+                        record.as_object_mut().unwrap().extend(context);
+                    }
+                    record.to_string()
+                };
+                std::fs::write(otel.join("a.jsonl"), record(trace_a, span_a, 100)).unwrap();
+                std::fs::write(otel.join("b.jsonl"), record(trace_b, span_b, 200)).unwrap();
+                let clients = ["copilot".to_string()];
+                let scan = || {
+                    parse_all_messages_with_pricing_with_env_strategy(
+                        source_home.path().to_str().unwrap(),
+                        &clients,
+                        None,
+                        false,
+                        &scanner::ScannerSettings::default(),
+                    )
+                };
+                let cold = scan();
+                let warm = scan();
+                let direct = parse_local_clients(LocalParseOptions {
+                    home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                    use_env_roots: false,
+                    clients: Some(clients.to_vec()),
+                    since: None,
+                    until: None,
+                    year: None,
+                    scanner_settings: scanner::ScannerSettings::default(),
+                })
+                .unwrap();
+                assert_eq!(cold, warm, "{operation}: {case}");
+                let expected = (expected_rows, if expected_rows == 1 { 200 } else { 300 });
+                assert_eq!(
+                    [
+                        (cold.len(), cold.iter().map(|m| m.tokens.input).sum::<i64>()),
+                        (warm.len(), warm.iter().map(|m| m.tokens.input).sum::<i64>()),
+                        (
+                            direct.messages.len(),
+                            direct.messages.iter().map(|m| m.input).sum::<i64>()
+                        ),
+                    ],
+                    [expected; 3],
+                    "{operation}: {case}; cold, warm, direct",
+                );
+                assert_eq!(direct.counts.get(ClientId::Copilot), expected_rows as i32);
+            }
         }
     }
 
