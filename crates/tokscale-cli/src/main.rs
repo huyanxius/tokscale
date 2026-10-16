@@ -221,7 +221,7 @@ enum Commands {
         billing_provider: Option<String>,
         #[arg(
             long,
-            help = "Fail validation on configuration errors (validation is always offline)"
+            help = "Fail validate-overrides on configuration errors (validation is always offline)"
         )]
         strict: bool,
         #[arg(long, help = "Disable spinner")]
@@ -3971,7 +3971,11 @@ fn run_pricing_lookup(
 
     let rt = Runtime::new()?;
     let result = match rt.block_on(async {
-        let context = tokscale_core::pricing::PricingContext::explicit(model_id, billing_provider);
+        // A billing label selects custom rules, not a public catalog namespace.
+        let context = tokscale_core::pricing::PricingContext {
+            upstream_hint: None,
+            ..tokscale_core::pricing::PricingContext::explicit(model_id, billing_provider)
+        };
         // A private custom-only query must not contact public catalogs.
         let local = PricingService::new_with_custom(
             tokscale_core::pricing::custom::CustomPricing::load_from_default_path(),

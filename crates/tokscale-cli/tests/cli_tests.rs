@@ -7424,6 +7424,46 @@ fn billing_custom_cli_is_offline_and_keeps_old_source_flag() {
 }
 
 #[test]
+fn billing_label_does_not_change_catalog_resolution() {
+    let tmp = TempDir::new().unwrap();
+    let model = "claude-sonnet-4-20250514";
+    prime_canonical_sonnet_pricing_cache(tmp.path(), model);
+    for source in [
+        None,
+        Some("litellm"),
+        Some("openrouter"),
+        Some("models.dev"),
+    ] {
+        let lookup = |billing: Option<&str>| {
+            let mut command = cmd_with_home(tmp.path());
+            command.args(["pricing", model, "--json", "--no-spinner"]);
+            if let Some(source) = source {
+                command.args(["--source", source]);
+            }
+            if let Some(billing) = billing {
+                command.args(["--billing-provider", billing]);
+            }
+            let output = command
+                .timeout(Duration::from_secs(10))
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap()
+        };
+        let baseline = lookup(None);
+        assert_eq!(baseline["scope"], "upstream");
+        for billing in ["unpriced:anything", "azure", "vertex"] {
+            let mut actual = lookup(Some(billing));
+            assert_eq!(actual["billingProviderId"], billing);
+            actual["billingProviderId"] = serde_json::Value::Null;
+            assert_eq!(actual, baseline, "source={source:?}, billing={billing}");
+        }
+    }
+}
+
+#[test]
 fn billing_strict_validation_rejects_invalid_and_unreadable_configuration() {
     let tmp = TempDir::new().unwrap();
     let config = sandbox_config_dir(tmp.path());
