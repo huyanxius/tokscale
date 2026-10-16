@@ -1910,7 +1910,8 @@ fn parser_version(client: ClientId) -> u32 {
         // authoritative $0.00. A snapshot that never carried a cost is
         // byte-identical before and after, so only this bump discards the v1
         // rows still holding a provider-reported zero.
-        ClientId::Fx => 2,
+        // v2->v3: preserve prefixed raw model identities for custom pricing.
+        ClientId::Fx => 3,
         // v1->v2: `amp threads export` payloads carry a per-message
         // `usage.timestamp`. Reparse old rows so those messages move off the
         // synthesized `created + messageId * 1000` time onto their real day.
@@ -8431,8 +8432,8 @@ mod tests {
         // the first scan. That is why widening the identity needs no
         // parser_version bump: nothing byte-identical parses differently, and
         // every pre-existing entry is already rebuilt exactly once. The counter
-        // below reads 2 for an unrelated reason -- the cost-provenance change
-        // in `test_fx_parser_version_invalidates_rows_without_cost_provenance`.
+        // below also includes the cost-provenance and raw-model pricing changes;
+        // neither is caused by adding the session sidecar to the fingerprint.
         let legacy = SourceFingerprint {
             related_files: Vec::new(),
             ..moved
@@ -8441,7 +8442,7 @@ mod tests {
             SourceFingerprint::check_fx_path_samples_only(&usage_path, Some(&legacy)),
             Some(FingerprintStatus::Changed(_))
         ));
-        assert_eq!(parser_version(ClientId::Fx), 2);
+        assert_eq!(parser_version(ClientId::Fx), 3);
     }
 
     #[test]
@@ -8450,7 +8451,8 @@ mod tests {
         // before and after the parser stopped stamping its absence as a
         // provider-reported $0.00, so the fingerprint keeps matching and only
         // this bump discards the v1 rows still holding the authoritative zero.
-        assert_eq!(parser_version(ClientId::Fx), 2);
+        // Generation 3 also rebuilds v2 rows missing the prefixed raw model key.
+        assert_eq!(parser_version(ClientId::Fx), 3);
     }
 
     #[test]
