@@ -1717,7 +1717,8 @@ fn parser_version(client: ClientId) -> u32 {
         // whole session or its journal line), and a journal replay of an
         // already-seen user message id no longer re-arms pending_turn_start
         // and mints a spurious turn.
-        ClientId::Jcode => 7,
+        // v7->v8: mutable snapshot routes no longer identify historical billing.
+        ClientId::Jcode => 8,
         // v5->v6: merge same-dedup-key Copilot spans before emitting messages.
         // v6->v7: all-zero trace/span ids (the W3C sentinel for "no recording
         // span context") are now treated as absent instead of as a real,
@@ -6098,7 +6099,7 @@ mod tests {
         // again here so those stale (start-anchored-but-still-wrong) v2/v1
         // cache entries are also invalidated.
         assert_eq!(parser_version(ClientId::Junie), 3);
-        assert_eq!(parser_version(ClientId::Jcode), 7);
+        assert_eq!(parser_version(ClientId::Jcode), 8);
         assert_eq!(parser_version(ClientId::DevinCli), 4);
         assert_eq!(parser_version(ClientId::Zcode), 3);
         assert_eq!(parser_version(ClientId::OpenCodeReview), 3);
