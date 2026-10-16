@@ -514,6 +514,7 @@ mod tests {
             billing_identity: crate::sessions::BillingIdentity::Unknown,
             pricing_model_id: None,
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
+            copilot_context: None,
             duration_ms: None,
         }
     }

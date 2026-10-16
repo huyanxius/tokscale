@@ -351,6 +351,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             billing_identity: super::BillingIdentity::Unknown,
             pricing_model_id: None,
             estimate_status: crate::sessions::EstimateStatus::Unpriced,
+            copilot_context: None,
         });
     }
 
@@ -395,6 +396,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
                 billing_identity: crate::sessions::BillingIdentity::Unknown,
                 pricing_model_id: None,
                 estimate_status: crate::sessions::EstimateStatus::Unpriced,
+                copilot_context: None,
             });
         }
     }

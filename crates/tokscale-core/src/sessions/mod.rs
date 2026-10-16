@@ -5,6 +5,7 @@
 pub mod amp;
 pub mod antigravity;
 pub mod antigravity_cli;
+pub mod aside;
 pub mod augment;
 pub mod cherrystudio;
 pub mod claudecode;
@@ -58,6 +59,7 @@ pub(crate) mod tencent_buddy;
 pub mod trae;
 pub mod unsloth;
 pub(crate) mod utils;
+pub mod vibe;
 pub mod warp;
 pub mod workbuddy;
 pub mod zcode;
@@ -175,6 +177,10 @@ pub struct UnifiedMessage {
     pub pricing_model_id: Option<String>,
     #[serde(default)]
     pub estimate_status: EstimateStatus,
+    /// Copilot-only attribution provenance. Stored in its namespace-specific
+    /// cache envelope so adding this does not change other clients' wire layout.
+    #[serde(skip)]
+    pub copilot_context: Option<copilot::CopilotContextProvenance>,
 }
 
 const fn default_message_count() -> i32 {
@@ -455,6 +461,7 @@ impl UnifiedMessage {
             parent_session_id: None,
             is_turn_start: false,
             model_attribution_conflicted: false,
+            copilot_context: None,
             billing_identity: BillingIdentity::Unknown,
             pricing_model_id: None,
             estimate_status: EstimateStatus::Unpriced,
@@ -539,7 +546,7 @@ impl UnifiedMessage {
         self.estimate_status = EstimateStatus::Authoritative;
     }
 
-    pub(crate) fn mark_estimated_cost(&mut self) {
+    pub fn mark_estimated_cost(&mut self) {
         self.cost_source = CostSource::Estimated;
     }
 
