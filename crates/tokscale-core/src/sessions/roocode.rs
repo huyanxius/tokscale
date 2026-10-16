@@ -120,7 +120,7 @@ pub(crate) fn parse_roo_kilo_file(path: &Path, source: &str) -> Vec<UnifiedMessa
             UnifiedMessage::new_with_agent(
                 source,
                 model,
-                provider.clone(),
+                provider,
                 session_id.clone(),
                 timestamp,
                 TokenBreakdown {
