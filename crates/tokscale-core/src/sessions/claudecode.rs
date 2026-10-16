@@ -1211,6 +1211,8 @@ fn parse_claude_lines(
         provider_confidences.push(provider_confidence);
     }
 
+    reconcile_advisor_billing(&mut messages);
+
     // Duplicate assembly is done, so the documented invariant
     // (`cache_write_1h` never exceeds `cache_write`) is restored here. An
     // initially inconsistent partial record — a 1-hour split arriving before
@@ -1266,6 +1268,34 @@ fn parse_claude_lines(
         messages,
         checkpoint,
     }
+}
+
+/// Reconcile supplementary advisor rows after parents have finished merging.
+/// Stable keys preserve this relationship across streaming, retained history,
+/// checkpoint resumes, and cross-file deduplication. Return changed rows so a
+/// caller holding estimated costs can reprice them against the final channel.
+pub(crate) fn reconcile_advisor_billing(messages: &mut [UnifiedMessage]) -> Vec<usize> {
+    let parents = claude_dedup_index(messages);
+    let mut changed = Vec::new();
+    for index in 0..messages.len() {
+        if messages[index].message_count != 0 || messages[index].has_authoritative_cost() {
+            continue;
+        }
+        let parent_index = messages[index].dedup_key.as_deref().and_then(|key| {
+            let (parent_key, position) = key.rsplit_once(":advisor:")?;
+            position.parse::<usize>().ok()?;
+            parents.get(parent_key).copied()
+        });
+        if let Some(parent_index) =
+            parent_index.filter(|&parent_index| messages[parent_index].message_count > 0)
+        {
+            if messages[index].billing_identity != messages[parent_index].billing_identity {
+                messages[index].billing_identity = messages[parent_index].billing_identity.clone();
+                changed.push(index);
+            }
+        }
+    }
+    changed
 }
 
 // Top-level usage already sums the main-model iterations, excluding advisors.
@@ -4327,6 +4357,7 @@ mod tests {
 mod advisor_usage_tests {
     use super::*;
     use serde_json::json;
+    use std::io::Write;
 
     fn fixture() -> Value {
         // Public, trimmed transcript from #1386; main iterations sum to top-level usage.
@@ -4363,6 +4394,46 @@ mod advisor_usage_tests {
         )
         .unwrap();
         parse_claude_file(&path)
+    }
+
+    #[test]
+    fn authoritative_advisor_keeps_its_recorded_amount_and_identity() {
+        for cost in [0.0, 7.25] {
+            let parent = UnifiedMessage::new(
+                "claude",
+                "parent-model",
+                "anthropic",
+                "s",
+                1,
+                TokenBreakdown::default(),
+                0.0,
+            )
+            .with_billing(
+                Some("anthropic"),
+                super::super::BillingIdentityOrigin::ExplicitRecord,
+            );
+            let mut advisor = UnifiedMessage::new(
+                "claude",
+                "advisor-model",
+                "vertex",
+                "s",
+                1,
+                TokenBreakdown::default(),
+                cost,
+            )
+            .with_billing(
+                Some("vertex"),
+                super::super::BillingIdentityOrigin::ExplicitRecord,
+            );
+            advisor.dedup_key = Some("msg:req:advisor:0".into());
+            advisor.message_count = 0;
+            advisor.mark_provider_reported_cost();
+            let original = advisor.clone();
+            let mut messages = vec![parent, advisor];
+            messages[0].dedup_key = Some("msg:req".into());
+            assert!(reconcile_advisor_billing(&mut messages).is_empty());
+            assert_eq!(messages[1], original);
+        }
     }
 
     #[test]
@@ -4459,6 +4530,124 @@ mod advisor_usage_tests {
             messages[2].dedup_key.as_deref(),
             Some("message:msg_adv:advisor:1")
         );
+    }
+
+    fn assert_advisor_billing_follows_parent(
+        session_provider: Option<&str>,
+        providers: &[Option<&str>],
+        expected_provider: Option<&str>,
+    ) {
+        for repeat_advisor in [true, false] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let config_dir = if let Some(provider) = session_provider {
+                let variant_dir = dir.path().join(".cc-mirror/advisor");
+                let config_dir = variant_dir.join("config");
+                std::fs::create_dir_all(&config_dir).unwrap();
+                std::fs::write(
+                    variant_dir.join("variant.json"),
+                    json!({"name": "advisor", "provider": provider, "configDir": config_dir})
+                        .to_string(),
+                )
+                .unwrap();
+                config_dir
+            } else {
+                dir.path().join(".claude")
+            };
+            let path = config_dir.join("projects/-tmp-repro/repro.jsonl");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let lines: Vec<String> = providers
+                .iter()
+                .enumerate()
+                .map(|(index, provider)| {
+                    let mut record = fixture();
+                    if let Some(provider) = provider {
+                        record["message"]["providerId"] = json!(provider);
+                    }
+                    record["message"]["usage"]["output_tokens"] = json!(779 + index);
+                    record["message"]["usage"]["iterations"][1]["output_tokens"] =
+                        json!(2343 + index);
+                    if !repeat_advisor && index > 0 {
+                        record["message"]["usage"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("iterations");
+                    }
+                    format!("{record}\n")
+                })
+                .collect();
+            std::fs::write(&path, lines.concat()).unwrap();
+            let full = parse_claude_file_with_checkpoint(&path, Some(dir.path()));
+            assert_eq!(full.messages.len(), 2);
+            let parent = &full.messages[0];
+            let advisor = &full.messages[1];
+            assert_eq!(
+                parent.billing_identity,
+                crate::sessions::BillingIdentity::from_explicit(
+                    expected_provider,
+                    crate::sessions::BillingIdentityOrigin::ExplicitRecord,
+                )
+            );
+            assert_eq!(advisor.billing_identity, parent.billing_identity);
+            assert_eq!(parent.tokens.output, 778 + providers.len() as i64);
+            assert_eq!(advisor.tokens.input, 114995);
+            assert_eq!(
+                advisor.tokens.output,
+                if repeat_advisor {
+                    2342 + providers.len() as i64
+                } else {
+                    2343
+                }
+            );
+            assert_eq!(advisor.pricing_context().raw_model, "claude-fable-5-1");
+            assert_eq!(advisor.cost, 0.0);
+            assert_eq!(advisor.cost_source, crate::sessions::CostSource::Unknown);
+            assert_eq!(parent.message_count, 1);
+            assert_eq!(advisor.message_count, 0);
+            assert_eq!(advisor.duration_ms, None);
+
+            for cut in 1..lines.len() {
+                std::fs::write(&path, lines[..cut].concat()).unwrap();
+                let prefix = parse_claude_file_with_checkpoint(&path, Some(dir.path()));
+                let checkpoint: ClaudeCheckpoint =
+                    bincode::deserialize(&bincode::serialize(&prefix.checkpoint.unwrap()).unwrap())
+                        .unwrap();
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(lines[cut..].concat().as_bytes())
+                    .unwrap();
+                let resumed =
+                    resume_claude_file(&path, Some(dir.path()), &checkpoint, &prefix.messages)
+                        .unwrap();
+                assert_eq!(resumed.messages, full.messages, "cut={cut}");
+                assert_eq!(resumed.checkpoint, full.checkpoint, "cut={cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn advisor_billing_identity_promotes_unknown_on_duplicate() {
+        assert_advisor_billing_follows_parent(None, &[None, Some("vertex"), None], Some("vertex"));
+    }
+
+    #[test]
+    fn advisor_billing_identity_replaces_session_channel_on_duplicate() {
+        assert_advisor_billing_follows_parent(
+            Some("anthropic"),
+            &[None, Some("vertex"), None],
+            Some("vertex"),
+        );
+    }
+
+    #[test]
+    fn advisor_billing_identity_conflict_stays_unknown_on_duplicate() {
+        for providers in [
+            [Some("anthropic"), Some("vertex"), Some("anthropic")],
+            [Some("vertex"), Some("anthropic"), Some("vertex")],
+        ] {
+            assert_advisor_billing_follows_parent(None, &providers, None);
+        }
     }
 
     #[test]

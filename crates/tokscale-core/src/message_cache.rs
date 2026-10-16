@@ -2035,8 +2035,9 @@ struct CacheShardKey {
 /// reads advisor iterations that generation 1 ignored. The old marker forces
 /// one live reparse through the retaining loader, preserving compacted turns
 /// rather than evicting the whole source cache with a parser-version bump.
-/// Neither marker is a real message index; the serialized layout is unchanged.
-const CLAUDE_RETAINED_PARSE_GENERATION: u32 = 2;
+/// Generation 3 synchronizes advisor billing identities with their final parent.
+/// No generation marker is a real message index; the serialized layout is unchanged.
+const CLAUDE_RETAINED_PARSE_GENERATION: u32 = 3;
 const CLAUDE_RETENTION_PROVENANCE_MARKER: usize =
     usize::MAX - (CLAUDE_RETAINED_PARSE_GENERATION as usize - 1);
 
@@ -2928,6 +2929,17 @@ impl CachedSourceEntry {
                 .contains(&CLAUDE_RETENTION_PROVENANCE_MARKER)
     }
 
+    /// Retention provenance survives parser-generation changes. An older
+    /// marker still distinguishes a known empty retained set from legacy
+    /// entries that never recorded one, even while the live parser must rebuild.
+    fn retention_provenance_marker(&self) -> Option<usize> {
+        self.fallback_timestamp_indices
+            .iter()
+            .copied()
+            .filter(|index| *index >= CLAUDE_RETENTION_PROVENANCE_MARKER)
+            .min()
+    }
+
     /// Whether this entry is carrying rows the live file may no longer
     /// contain — either an identified retained set, or a pre-provenance entry
     /// that cannot say which of its rows are retained and has to be assumed to
@@ -2937,11 +2949,11 @@ impl CachedSourceEntry {
     /// elsewhere the index vector means something else entirely.
     pub(crate) fn holds_retained_history(&self) -> bool {
         self.is_claude_namespace()
-            && (self.needs_retention_provenance_migration()
+            && (self.retention_provenance_marker().is_none()
                 || self
                     .fallback_timestamp_indices
                     .iter()
-                    .any(|index| *index != CLAUDE_RETENTION_PROVENANCE_MARKER))
+                    .any(|index| *index < self.messages.len()))
     }
 
     pub(crate) fn retained_message_keys(&self) -> HashSet<String> {
@@ -3002,15 +3014,18 @@ impl CachedSourceEntry {
         // Repairing placeholder rows tells us nothing about which turns are
         // retained, so an entry that arrived without provenance still needs
         // the rebuild afterwards.
-        let had_provenance = !self.needs_retention_provenance_migration();
+        let provenance_marker = self.retention_provenance_marker();
         let changed =
             crate::sessions::claudecode::remove_synthetic_placeholder_messages(&mut self.messages);
         if changed {
             self.fallback_timestamp_indices =
                 Self::claude_retained_indices(&self.messages, &retained_keys);
-            if !had_provenance {
-                self.fallback_timestamp_indices
-                    .retain(|index| *index != CLAUDE_RETENTION_PROVENANCE_MARKER);
+            self.fallback_timestamp_indices
+                .retain(|index| *index != CLAUDE_RETENTION_PROVENANCE_MARKER);
+            // Sanitation neither discovers retention provenance nor upgrades
+            // the parser generation. Preserve whichever marker was recorded.
+            if let Some(marker) = provenance_marker {
+                self.fallback_timestamp_indices.push(marker);
             }
         }
         changed
@@ -3335,9 +3350,9 @@ impl SourceMessageCache {
                     state.dirty = true;
                     continue;
                 }
-                // A source that no longer exists can never be scanned again,
-                // so its entry is dead weight in memory and on disk.
-                if !key.path.to_path_buf().exists() && !entry.is_claude_namespace() {
+                // Only retained Claude history can outlive a missing source;
+                // an ordinary deleted session must stop contributing usage.
+                if !key.path.to_path_buf().exists() && !entry.holds_retained_history() {
                     state.deleted_keys.insert(key, DeletionReason::Missing);
                     state.dirty = true;
                     continue;
@@ -3388,7 +3403,7 @@ impl SourceMessageCache {
             .entries
             .values()
             .filter(|entry| {
-                entry.is_claude_namespace()
+                entry.holds_retained_history()
                     && !entry.path.to_path_buf().exists()
                     && roots
                         .iter()
@@ -3785,15 +3800,17 @@ fn read_shard(path: &Path, identity: CacheIdentity) -> ShardReadStatus {
     read_shard_with_limit(path, identity, MAX_CACHE_SHARD_BYTES)
 }
 
-/// Every legacy format that predates the 1-hour split migrates through here:
-/// a Claude entry with no 1-hour split drops its retention marker so the next
-/// scan reparses the live file.
+/// Every legacy format that predates the 1-hour split migrates through here.
+/// An old generation forces a live reparse without discarding the distinction
+/// between a known empty retained set and unknowable pre-provenance history.
 fn migrated_shard(mut entries: Vec<CachedSourceEntry>) -> ShardReadStatus {
     for entry in &mut entries {
         if entry.is_claude_namespace() {
-            entry
-                .fallback_timestamp_indices
-                .retain(|index| *index != CLAUDE_RETENTION_PROVENANCE_MARKER);
+            for index in &mut entry.fallback_timestamp_indices {
+                if *index == CLAUDE_RETENTION_PROVENANCE_MARKER {
+                    *index = usize::MAX; // Retention generation 1 needs a rebuild.
+                }
+            }
         }
     }
     ShardReadStatus::Migrated(entries)
@@ -3807,7 +3824,7 @@ fn read_shard_with_limit(
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ShardReadStatus::Missing
+            return ShardReadStatus::Missing;
         }
         Err(error) => return ShardReadStatus::Invalid(error.to_string()),
     };
@@ -9509,7 +9526,7 @@ mod tests {
         cache_write_1h: i64,
         service_tier: Option<&str>,
         format_version: u32,
-        strip_retention_provenance: bool,
+        rebuild_retention_generation: bool,
         serialize_legacy_entries: impl FnOnce(CachedSourceEntry) -> Vec<u8>,
         assert_version_specific: impl FnOnce(&CachedSourceEntry),
     ) {
@@ -9567,8 +9584,8 @@ mod tests {
             Some("uuid:retained-assistant-turn")
         );
         assert_version_specific(&migrated);
-        if strip_retention_provenance {
-            assert_eq!(migrated.fallback_timestamp_indices, vec![1]);
+        if rebuild_retention_generation {
+            assert_eq!(migrated.fallback_timestamp_indices, vec![1, usize::MAX]);
             assert!(migrated.needs_retention_provenance_migration());
         } else {
             assert_eq!(
@@ -11852,7 +11869,7 @@ mod tests {
                 assert!(matches!(
                     m.billing_identity,
                     crate::sessions::BillingIdentity::Unknown
-                )); // Adjust module import if exported elsewhere.
+                ));
             }
             if micode {
                 let rows = entry
@@ -11872,11 +11889,12 @@ mod tests {
                     );
                     assert_eq!(row.row.has_embedded_id, i != 1);
                 }
-            } else if version >= 9 {
-                assert_eq!(entry.fallback_timestamp_indices, vec![1, 2, usize::MAX - 1]);
             } else {
-                // Baseline removes the retention-generation marker only; does not discard rows.
-                assert_eq!(entry.fallback_timestamp_indices, vec![1, 2]);
+                // The literal producer recorded generation 2. Its retained set
+                // remains trustworthy even though the live parser must rebuild.
+                assert_eq!(entry.fallback_timestamp_indices, vec![1, 2, usize::MAX - 1]);
+                assert!(entry.needs_retention_provenance_migration());
+                assert!(entry.holds_retained_history());
             }
             let rewritten = dir.path().join("rewritten.bin");
             write_shard_with_limit(&rewritten, identity, &entries, MAX_CACHE_SHARD_BYTES).unwrap();
@@ -11923,6 +11941,114 @@ mod tests {
                 retained,
                 "{client:?}"
             );
+        }
+    }
+
+    #[test]
+    fn previous_claude_advisor_generation_rebuilds_without_inventing_retention() {
+        let source = write_temp_file(b"synthetic Claude source");
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let mut entry = test_entry(identity, source.path(), "previous-advisor-generation");
+        // Generation 2 already recorded whether compacted history was retained,
+        // but needs one live rebuild to synchronize advisor billing identities.
+        entry.fallback_timestamp_indices = vec![usize::MAX - 1];
+        assert!(entry.needs_retention_provenance_migration());
+        assert!(!entry.holds_retained_history());
+        entry.fallback_timestamp_indices.insert(0, 0);
+        assert!(entry.holds_retained_history());
+        entry.fallback_timestamp_indices.clear();
+        assert!(
+            entry.holds_retained_history(),
+            "pre-provenance history remains conservative"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_retention_generations_survive_sanitation_and_missing_source_reload() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        for marker in [
+            None,
+            Some(usize::MAX),
+            Some(usize::MAX - 1),
+            Some(CLAUDE_RETENTION_PROVENANCE_MARKER),
+        ] {
+            for retained in [false, true] {
+                let source = write_temp_file(b"synthetic Claude source");
+                let path = source.path().to_path_buf();
+                let real = keyed_message("claude", "session", "live:req_live");
+                let synthetic = synthetic_placeholder_message("session", "synthetic:req_synthetic");
+                let mut entry = entry_with_messages(identity, &path, vec![synthetic, real]);
+                entry.fallback_timestamp_indices = if retained { vec![1] } else { Vec::new() };
+                entry.fallback_timestamp_indices.extend(marker);
+                assert!(entry.remove_claude_synthetic_placeholders());
+                assert_eq!(entry.messages.len(), 1);
+                assert_eq!(entry.retention_provenance_marker(), marker);
+                assert_eq!(
+                    entry.needs_retention_provenance_migration(),
+                    marker != Some(CLAUDE_RETENTION_PROVENANCE_MARKER)
+                );
+                assert_eq!(entry.holds_retained_history(), retained || marker.is_none());
+                assert_eq!(
+                    entry.retained_message_keys().contains("live:req_live"),
+                    retained
+                );
+                let mut cache = SourceMessageCache::load();
+                cache.insert(entry);
+                cache.save_if_dirty();
+                let mut cache = SourceMessageCache::load();
+                let loaded = cache.get(identity, &path).unwrap();
+                assert_eq!(loaded.retention_provenance_marker(), marker);
+                assert_eq!(
+                    loaded.holds_retained_history(),
+                    retained || marker.is_none()
+                );
+                drop(source);
+                let should_remain = retained || marker.is_none();
+                assert_eq!(
+                    cache
+                        .missing_claude_history(&[path.parent().unwrap().to_path_buf()])
+                        .iter()
+                        .any(|entry| entry.path.to_path_buf() == path),
+                    should_remain
+                );
+                cache.save_if_dirty();
+                let mut missing = SourceMessageCache::load();
+                assert_eq!(missing.get(identity, &path).is_some(), should_remain);
+                missing.save_if_dirty();
+                assert_eq!(
+                    SourceMessageCache::load().get(identity, &path).is_some(),
+                    should_remain
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_claude_sources_without_retained_history_are_pruned() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        for generation in [0, 1] {
+            let source = write_temp_file(b"synthetic current Claude source");
+            let path = source.path().to_path_buf();
+            let mut entry = test_entry(identity, &path, "ordinary-missing");
+            entry.fallback_timestamp_indices = vec![CLAUDE_RETENTION_PROVENANCE_MARKER];
+            entry.billing_identity_generation = generation;
+            assert!(!entry.holds_retained_history());
+            let mut cache = SourceMessageCache::load();
+            cache.insert(entry);
+            cache.save_if_dirty();
+            drop(source);
+            let roots = [path.parent().unwrap().to_path_buf()];
+            assert!(cache.missing_claude_history(&roots).is_empty());
+            let mut reloaded = SourceMessageCache::load();
+            assert!(reloaded.get(identity, &path).is_none());
+            reloaded.save_if_dirty();
+            assert!(SourceMessageCache::load().get(identity, &path).is_none());
         }
     }
 

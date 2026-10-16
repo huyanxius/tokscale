@@ -1417,7 +1417,11 @@ fn parse_all_messages_streaming<S: MessageSink>(
         cached: message_cache::CachedSourceEntry,
         pricing: Option<&pricing::PricingService>,
     ) -> Vec<UnifiedMessage> {
+        let is_claude = cached.is_claude_namespace();
         let mut messages = cached.messages;
+        if is_claude {
+            sessions::claudecode::reconcile_advisor_billing(&mut messages);
+        }
         apply_pricing_to_messages(&mut messages, pricing);
         messages
     }
@@ -1789,7 +1793,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         let SourceParse {
             mut messages,
             cacheable,
-            claude_checkpoint,
+            mut claude_checkpoint,
         } = resumed.unwrap_or_else(|| parse(path, Some(&fingerprint)));
         if !cacheable && preserve_cached_on_failure {
             if let Some(entry) = cached {
@@ -1816,6 +1820,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         // would retire them from history (#994). Only merge when the parse is
         // cacheable: an untrustworthy parse must not be used to synthesise an
         // entry; the failed cache was invalidated above.
+        let live_message_count = messages.len();
         let mut retained_message_keys = HashSet::new();
         if let HistoryRetention::RetainObserved {
             key_is_globally_stable,
@@ -1828,6 +1833,14 @@ fn parse_all_messages_streaming<S: MessageSink>(
                         &cached.messages,
                         key_is_globally_stable,
                     );
+                }
+                if identity == message_cache::CacheIdentity::for_client(ClientId::Claude) {
+                    let changed = sessions::claudecode::reconcile_advisor_billing(&mut messages);
+                    // Retained tail rows are outside the parser checkpoint.
+                    // Only a changed live prefix requires a fresh full parse.
+                    if changed.iter().any(|&index| index < live_message_count) {
+                        claude_checkpoint = None;
+                    }
                 }
             }
         }
@@ -2996,6 +3009,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
         for message in &mut claude_messages {
             apply_pricing_if_available(message, pricing);
         }
+    }
+    for index in sessions::claudecode::reconcile_advisor_billing(&mut claude_messages) {
+        apply_pricing_if_available(&mut claude_messages[index], pricing);
     }
     all_messages.extend(claude_messages);
     flush_lane(&mut all_messages, &flush_context, sink);
@@ -6598,6 +6614,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     if include_all || clients.iter().any(|client| client == "claude") {
         claude_desktop::read(Path::new(&home_dir)).merge_into(&mut claude_messages);
     }
+    sessions::claudecode::reconcile_advisor_billing(&mut claude_messages);
     let claude_msgs: Vec<_> = claude_messages.iter().map(unified_to_parsed).collect();
     // Advisor calls and undated Desktop balances add usage, not extra replies.
     counts.set(ClientId::Claude, summed_parsed_message_count(&claude_msgs));
@@ -13024,14 +13041,48 @@ mod tests {
         }
     }
 
-    /// The retention above must not resurrect a session the user deleted:
-    /// `prune_missing_files` drops the entry when the file is gone, which is
-    /// the behavior `d9df8c9c` (local session cleanup) depends on.
-    ///
-    /// The transcript is compacted first, and retention is asserted, so the
-    /// deletion runs against an entry that really is holding a turn the live
-    /// file no longer has. Deleting straight after a cold scan would prove
-    /// nothing about retention.
+    #[test]
+    #[serial_test::serial]
+    fn test_claude_deleted_uncompacted_transcript_is_not_replayed() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        let transcript = source_home
+            .path()
+            .join(".claude/projects/myproject/plain.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_plain","message":{"id":"msg_plain","model":"claude-sonnet-4","usage":{"input_tokens":100,"output_tokens":50}}}
+"#).unwrap();
+        let scan = || {
+            parse_all_messages_with_pricing_with_env_strategy(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+                false,
+                &scanner::ScannerSettings::default(),
+            )
+        };
+        assert_eq!(scan().len(), 1);
+        let identity = message_cache::CacheIdentity::for_client(ClientId::Claude);
+        let entry = message_cache::SourceMessageCache::load()
+            .get(identity, &transcript)
+            .unwrap();
+        assert!(!entry.holds_retained_history());
+        std::fs::remove_file(&transcript).unwrap();
+        assert!(
+            scan().is_empty(),
+            "deleting an uncompacted session must remove its usage"
+        );
+        assert!(
+            scan().is_empty(),
+            "the stale entry must remain absent on a warm scan"
+        );
+    }
+
+    /// A compacted transcript's cache holds history the live file no longer
+    /// contains. Preserve that observed history if the remaining source is
+    /// deleted, until the user explicitly clears the cache. An uncompacted
+    /// source deletion is covered separately above and must not be replayed.
     #[test]
     #[serial_test::serial]
     fn test_claude_deleted_transcript_keeps_cached_compacted_history() {
@@ -13435,6 +13486,196 @@ mod tests {
             assert_eq!(parsed.messages.len(), 1);
             assert_eq!(parsed.messages[0].input, 100);
             assert_eq!(parsed.messages[0].output, 20);
+        }
+    }
+
+    fn claude_advisor_billing_record(provider: &str, include_advisor: bool) -> String {
+        let mut row = serde_json::json!({
+            "type": "assistant", "timestamp": "2026-10-02T20:10:51.000Z",
+            "requestId": "req_advisor", "providerId": provider,
+            "message": {"id": "msg_advisor", "model": "fixture-parent", "usage": {
+                "input_tokens": 10, "output_tokens": 0,
+            }}
+        });
+        if include_advisor {
+            row["message"]["usage"]["iterations"] = serde_json::json!([
+                {"type": "advisor_message", "model": "fixture-advisor",
+                 "input_tokens": 20, "output_tokens": 0}
+            ]);
+        }
+        format!("{row}\n")
+    }
+
+    fn claude_advisor_billing_pricing(multiplier: f64) -> pricing::PricingService {
+        let rate = |value: f64| serde_json::json!({"input_cost_per_token": value * multiplier});
+        let custom = pricing::custom::CustomPricing::load_from_str(
+            &serde_json::json!({
+                "models": {"fixture-parent": rate(1.0), "fixture-advisor": rate(1.0)},
+                "provider_overrides": [
+                    {"provider_id": "vertex", "model_id": "fixture-parent", "pricing": rate(2.0)},
+                    {"provider_id": "vertex", "model_id": "fixture-advisor", "pricing": rate(2.0)},
+                    {"provider_id": "anthropic", "model_id": "fixture-parent", "pricing": rate(3.0)},
+                    {"provider_id": "anthropic", "model_id": "fixture-advisor", "pricing": rate(3.0)}
+                ]
+            })
+            .to_string(),
+            std::path::Path::new("synthetic-advisor-pricing.json"),
+        );
+        assert!(custom.diagnostics().is_empty());
+        pricing::PricingService::new_with_custom(custom, HashMap::new(), HashMap::new())
+    }
+
+    fn assert_claude_advisor_billing_prices(
+        messages: &[UnifiedMessage],
+        provider: Option<&str>,
+        parent_cost: f64,
+        advisor_cost: f64,
+    ) {
+        assert_eq!(messages.len(), 2);
+        for (model, input, cost, count) in [
+            ("fixture-parent", 10, parent_cost, 1),
+            ("fixture-advisor", 20, advisor_cost, 0),
+        ] {
+            let message = messages.iter().find(|m| m.model_id == model).unwrap();
+            assert_eq!(message.billing_identity.id(), provider, "{model}");
+            assert_eq!(message.tokens.input, input);
+            assert_eq!(message.tokens.output, 0);
+            assert_eq!(message.message_count, count);
+            assert_eq!(message.cost, cost, "{model}");
+            assert_eq!(message.cost_source, sessions::CostSource::Estimated);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_advisor_billing_reconciles_retained_rows_after_parent_rewrite() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let _env = redirect_cache_home(cache_home.path());
+        let path = home.path().join(".claude/projects/advisor/live.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let scan = |multiplier| {
+            parse_all_messages_with_pricing(
+                home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                Some(&claude_advisor_billing_pricing(multiplier)),
+            )
+        };
+        std::fs::write(&path, claude_advisor_billing_record("vertex", true)).unwrap();
+        assert_claude_advisor_billing_prices(&scan(1.0), Some("vertex"), 20.0, 40.0);
+        std::fs::write(&path, claude_advisor_billing_record("anthropic", false)).unwrap();
+        assert_claude_advisor_billing_prices(&scan(1.0), Some("anthropic"), 30.0, 60.0);
+        assert_claude_advisor_billing_prices(&scan(2.0), Some("anthropic"), 60.0, 120.0);
+
+        // Updating retained tail rows must not spoil the live prefix checkpoint.
+        crate::CLAUDE_RESUMED_PATHS.lock().unwrap().clear();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(claude_advisor_billing_record("anthropic", false).as_bytes())
+            .unwrap();
+        assert_claude_advisor_billing_prices(&scan(1.0), Some("anthropic"), 30.0, 60.0);
+        assert!(crate::CLAUDE_RESUMED_PATHS.lock().unwrap().contains(&path));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_advisor_billing_reconciles_fully_compacted_pair_and_warm_cache() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let _env = redirect_cache_home(cache_home.path());
+        let path = home.path().join(".claude/projects/advisor/compacted.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let scan = |multiplier| {
+            parse_all_messages_with_pricing(
+                home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                Some(&claude_advisor_billing_pricing(multiplier)),
+            )
+        };
+        std::fs::write(&path, claude_advisor_billing_record("vertex", true)).unwrap();
+        assert_claude_advisor_billing_prices(&scan(1.0), Some("vertex"), 20.0, 40.0);
+        let stale_advisor = || {
+            let mut cache = message_cache::SourceMessageCache::load();
+            let mut entry = cache
+                .all_entries()
+                .into_iter()
+                .find(|entry| entry.path.to_path_buf() == path)
+                .unwrap();
+            entry
+                .messages
+                .iter_mut()
+                .find(|message| message.model_id == "fixture-advisor")
+                .unwrap()
+                .billing_identity = sessions::BillingIdentity::Unknown;
+            // Simulate an old advisor identity without forging checkpoint integrity.
+            entry.claude_checkpoint = None;
+            cache.insert(entry);
+            cache.save_if_dirty();
+        };
+        stale_advisor();
+        std::fs::write(&path, "").unwrap();
+        assert_claude_advisor_billing_prices(&scan(1.0), Some("vertex"), 20.0, 40.0);
+        // Save-time retained-history merges can also leave a stale warm advisor.
+        stale_advisor();
+        assert_claude_advisor_billing_prices(&scan(2.0), Some("vertex"), 40.0, 80.0);
+        std::fs::remove_file(&path).unwrap();
+        assert_claude_advisor_billing_prices(&scan(1.0), Some("vertex"), 20.0, 40.0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_advisor_billing_uses_final_cross_file_parent_conflict() {
+        for (advisor_name, other_name) in [("aaa.jsonl", "zzz.jsonl"), ("zzz.jsonl", "aaa.jsonl")] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let _env = redirect_cache_home(cache_home.path());
+            let project = home.path().join(".claude/projects/advisor");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::write(
+                project.join(advisor_name),
+                claude_advisor_billing_record("vertex", true),
+            )
+            .unwrap();
+            std::fs::write(
+                project.join(other_name),
+                claude_advisor_billing_record("anthropic", false),
+            )
+            .unwrap();
+            std::fs::write(
+                project.join("middle.jsonl"),
+                claude_advisor_billing_record("vertex", false),
+            )
+            .unwrap();
+            for multiplier in [1.0, 2.0] {
+                let messages = parse_all_messages_with_pricing(
+                    home.path().to_str().unwrap(),
+                    &["claude".to_string()],
+                    Some(&claude_advisor_billing_pricing(multiplier)),
+                );
+                assert_claude_advisor_billing_prices(
+                    &messages,
+                    None,
+                    10.0 * multiplier,
+                    20.0 * multiplier,
+                );
+            }
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["claude".to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+            assert_eq!(parsed.messages.len(), 2);
+            assert!(parsed
+                .messages
+                .iter()
+                .all(|m| m.billing_identity.id().is_none()));
         }
     }
 
