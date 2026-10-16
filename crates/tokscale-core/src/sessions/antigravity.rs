@@ -163,6 +163,35 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "claude-opus-4-6");
         assert_eq!(messages[0].provider_id, "anthropic");
+        assert_eq!(
+            messages[0].billing_identity,
+            super::super::BillingIdentity::Unknown
+        );
+        assert_eq!(
+            messages[0].pricing_model_id.as_deref(),
+            Some("MODEL_PLACEHOLDER_M26")
+        );
+    }
+
+    #[test]
+    fn explicit_billing_channel_keeps_raw_model_separate_from_display_alias() {
+        let input = r#"{"type":"usage","sessionId":"abc","modelId":"MODEL_PLACEHOLDER_M26","providerId":" VERTEX ","timestamp":1711200000000,"input":12,"output":4}"#;
+        let path = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(path.path(), input).unwrap();
+        let messages = parse_antigravity_file(path.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "claude-opus-4-6");
+        assert_eq!(
+            messages[0].pricing_model_id.as_deref(),
+            Some("MODEL_PLACEHOLDER_M26")
+        );
+        assert_eq!(
+            messages[0].billing_identity,
+            super::super::BillingIdentity::Known {
+                id: "vertex".into(),
+                origin: super::super::BillingIdentityOrigin::ExplicitRecord,
+            }
+        );
     }
 
     #[test]

@@ -294,6 +294,25 @@ fn scoped_free_and_authoritative_zero_have_distinct_success_states() {
 }
 
 #[test]
+fn zed_hosted_multiplier_uses_attribution_not_custom_billing_selector() {
+    let svc = service(
+        json!({"models":{"atlas":{"input_cost_per_million_tokens":2.}},"provider_overrides":[rule("private","atlas",3.),rule("zed.dev","atlas",10.)]}),
+    );
+    for (attribution, billing, expected_rate, multiplier) in [
+        ("zed.dev", Some("private"), 3., 1.1),
+        ("zed.dev", None, 2., 1.1),
+        ("openai", Some("zed.dev"), 10., 1.),
+    ] {
+        let message = UnifiedMessage::new("zed", "atlas", attribution, "s", 1, usage(), 0.)
+            .with_billing(billing, BillingIdentityOrigin::ExplicitRecord);
+        let explain = svc.explain_message(&message);
+        assert_eq!(explain.effective_multiplier, multiplier);
+        assert!((explain.final_estimate - expected_rate * multiplier).abs() < 1e-10);
+        assert_eq!(svc.estimate_message(&message).cost, explain.final_estimate);
+    }
+}
+
+#[test]
 fn parser_sqlite_dedup_does_not_fold_different_billing_channels() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("opencode.db");

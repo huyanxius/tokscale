@@ -472,6 +472,10 @@ fn test_parse_hermes_sqlite_ignores_unknown_billing_provider_and_falls_back_to_m
     let messages = parse_hermes_sqlite(&db_path);
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].provider_id, "openai");
+    assert_eq!(
+        messages[0].billing_identity,
+        tokscale_core::sessions::BillingIdentity::Unknown
+    );
 }
 
 #[test]
@@ -1348,6 +1352,9 @@ fn test_parse_hermes_sqlite_separates_null_and_empty_billing_providers() {
 
     let messages = parse_hermes_sqlite(&db_path);
     assert_eq!(messages.len(), 2);
+    assert!(messages.iter().all(
+        |message| message.billing_identity == tokscale_core::sessions::BillingIdentity::Unknown
+    ));
 
     let keys: HashSet<&str> = messages
         .iter()
