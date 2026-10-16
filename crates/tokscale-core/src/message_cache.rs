@@ -4584,6 +4584,11 @@ mod tests {
             .messages
             .iter()
             .all(|m| m.billing_identity.id().is_none()));
+        let fixture_timezone = crate::bucket_tz::BucketTimezone::Pinned(chrono_tz::UTC);
+        assert!(entries[0]
+            .messages
+            .iter()
+            .all(|message| message.date == "2026-10-01"));
         let cached = entries[0].codex_incremental.as_ref().unwrap();
         assert_eq!(serde_json::to_value(cached).unwrap(), expected);
         assert_eq!(cached.consumed_offset, prefix.len() as u64);
@@ -4596,6 +4601,7 @@ mod tests {
         let ShardReadStatus::Loaded(mut warm) = read_shard(&shard, identity) else {
             panic!("migrated state must survive a current-format warm reload");
         };
+        assert_eq!(warm[0].messages, entries[0].messages);
         let entry = warm.remove(0);
         assert_eq!(entry.billing_identity_generation, 0);
         let cached = entry.codex_incremental.unwrap();
@@ -4637,12 +4643,18 @@ mod tests {
         let mut resumed = entry.messages;
         resumed.extend(pending.messages);
         assert_eq!(resumed.len(), 3);
+        assert_eq!(resumed.len(), fresh.messages.len());
         assert_eq!(resumed.iter().map(|m| m.tokens.total()).sum::<i64>(), 660);
         // Historical rows intentionally have no inferred billing identity; a
         // complete identity backfill is a separate cache-loader operation.
-        for (actual, mut fresh) in resumed.iter().zip(fresh.messages) {
+        // The frozen producer ran in UTC; newly parsed display dates follow
+        // the host timezone. Compare copies in one zone without changing the
+        // historical payload or the process-global timezone.
+        for (mut actual, mut fresh) in resumed.into_iter().zip(fresh.messages) {
+            actual.rebucket_date(&fixture_timezone);
+            fresh.rebucket_date(&fixture_timezone);
             fresh.billing_identity = actual.billing_identity.clone();
-            assert_eq!(actual, &fresh);
+            assert_eq!(actual, fresh);
         }
         assert_eq!(fresh.state.turn_coverage, settled.state.turn_coverage);
         let mut fresh_state = serde_json::to_value(&fresh.state).unwrap();
@@ -4727,7 +4739,10 @@ mod tests {
                 &["claude".to_string()],
                 None,
                 false,
-                &crate::scanner::ScannerSettings::default(),
+                &crate::scanner::ScannerSettings {
+                    bucket_timezone: Some("UTC".to_string()),
+                    ..Default::default()
+                },
             )
         };
         let mut missing = scan();
