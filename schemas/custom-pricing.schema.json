@@ -26,7 +26,7 @@
         "properties": {
           "provider_id": {
             "type": "string",
-            "pattern": "^(?!\\s*[uU][nN][kK][nN][oO][wW][nN]\\s*$).*\\S.*$"
+            "pattern": "^(?!\\s*[uU][nN][kK][nN][oO][wW][nN]\\s*$)[\\s\\S]*\\S[\\s\\S]*$"
           },
           "model_id": {
             "type": "string",

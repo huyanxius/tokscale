@@ -556,10 +556,7 @@ impl CustomPricing {
     }
 
     fn error(&mut self, file: &Path, path: &str, code: &str, message: String) {
-        warn_custom_pricing(
-            file,
-            format_args!("{code} at {path}: {message}; invalid rule skipped"),
-        );
+        warn_custom_pricing(file, format_args!("{code} at {path}: {message}"));
         self.diagnostics.push(CustomPricingDiagnostic {
             file: file.display().to_string(),
             code: code.into(),

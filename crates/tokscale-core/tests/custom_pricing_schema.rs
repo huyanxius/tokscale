@@ -145,7 +145,15 @@ fn schema_matches_runtime_scoped_selector_validation() {
         value["provider_overrides"][0]["provider_id"] = json!(provider);
         assert_validation(value, false, 0);
     }
-    for provider in [" VERTEX ", "openrouter/google", "123", "gateway_a"] {
+    for provider in [
+        " VERTEX ",
+        "openrouter/google",
+        "123",
+        "gateway_a",
+        "vertex\n",
+        "\nvertex",
+        "a\nb",
+    ] {
         let mut value = scoped(json!({"input_cost_per_token": 0.0}));
         value["provider_overrides"][0]["provider_id"] = json!(provider);
         assert_validation(value, true, 1);
