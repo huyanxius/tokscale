@@ -1033,9 +1033,10 @@ fn parse_pi_format_file_inner(
             agent.clone(),
         )
         .with_billing(
+            // A billed operation carries no assistant message, so it supplies
+            // no record-level billing evidence and stays Unknown.
             message
-                .provider
-                .as_deref()
+                .and_then(|message| message.provider.as_deref())
                 .filter(|provider| accepts_replacement_field(provider, options.lossy_line_reader)),
             super::BillingIdentityOrigin::ExplicitRecord,
         );
