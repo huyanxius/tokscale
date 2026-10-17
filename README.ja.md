@@ -540,7 +540,7 @@ JSON スキーマは、このリポジトリの [schemas/custom-pricing.schema.j
 
 #### 課金チャネル別の価格
 
-従来のグローバル `models` に加え、`provider_overrides` を設定できます。`tokscale pricing MODEL --billing-provider vertex --source custom --json --no-spinner` で照会します。従来の `--provider` は価格データのソース指定のままです。チャネルはログの完全なラベルを前後空白除去・ASCII 大文字小文字無視で比較し、モデル名から推定しません。実際の請求先やアカウントを検証する機能ではありません。
+従来のグローバル `models` に加え、`provider_overrides` を設定できます。`tokscale pricing MODEL --billing-provider vertex --source custom --json --no-spinner` で照会します。従来の `--provider` は価格データのソース指定のままです。チャネルはログの完全なラベルを前後空白除去・ASCII 大文字小文字無視で比較し、モデル名から推定しません。実際の請求先やアカウントを検証する機能ではありません。未知のチャネルはグローバル/アップストリームの推定価格のみを使用します。
 
 `tokscale pricing validate-overrides --strict --json --no-spinner` はオフライン検証、`tokscale pricing explain --json --no-spinner` はローカルのメッセージ別価格・倍率・カバレッジ・状態レポートです。カスタム価格は基本料金で、記録済みの確定費用はゼロも保持します。編集後は再起動してください。過去の推定額は現在の料金で再計算し、失効した推定額は合計に含めません。旧バージョンへのダウングレードではチャネル別ルールが無視されます。[優先順位、キャッシュ移行、設定例](docs/provider-pricing.md)。
 
