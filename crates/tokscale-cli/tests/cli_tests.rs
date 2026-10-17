@@ -7354,7 +7354,8 @@ fn test_codex_compressed_session_reports_usage() {
     }
 }
 
-#[test]fn billing_custom_cli_is_offline_and_keeps_old_source_flag() {
+#[test]
+fn billing_custom_cli_is_offline_and_keeps_old_source_flag() {
     let tmp = TempDir::new().unwrap();
     let config = sandbox_config_dir(tmp.path());
     fs::create_dir_all(&config).unwrap();
