@@ -1593,8 +1593,9 @@ const SHARED_PARSER_FAMILIES: &[SharedParserFamily] = &[
             // reparsed.
             // v4->v5: clamp CLI input after signed cache subtraction so warm
             // sources cannot replay negative tokens into submission totals.
-            // v5->v6: billing evidence inherited from the CLI session manifest
-            // is labelled session-level instead of record-level.
+            // v6->v7: billing evidence inherited from the CLI session manifest
+            // is labelled session-level instead of record-level (the shared
+            // base's overlap fix moved v5 to v6 in the same release).
             (ClientId::Cline, 4),
         ],
     },
@@ -4284,12 +4285,15 @@ fn read_shard_with_limit_unchecked(
         }
         LEGACY_CACHE_FORMAT_VERSION_V10 => {
             // Main's parser 18 added pending and settled response records to
-            // the positional state. It must not be decoded as parser 15. The
-            // current type is safe only under this exact version guard; the
-            // upstream-produced fixture pins every persisted state field.
+            // the positional state, and the parser 19 attribution bump kept
+            // that state layout byte-identical (the upstream-produced parser-19
+            // fixture pins every persisted state field). It must not be decoded
+            // as parser 15. The current type is safe only under this exact
+            // version guard; the envelope gate above already rejected every
+            // other parser version as stale.
             if identity.namespace == ClientId::Codex.as_str() {
                 match identity.parser_version {
-                    18 => {
+                    19 => {
                         read_legacy_v10::<CodexIncrementalCache>(&envelope.payload, max_shard_bytes)
                     }
                     15 => read_legacy_v10::<LegacyCodexIncrementalV15>(
@@ -4732,14 +4736,17 @@ mod tests {
     }
 
     #[test]
-    fn released_codex_v10_parser18_preserves_state_and_resumes_without_double_counting() {
+    fn released_codex_v10_parser19_preserves_state_and_resumes_without_double_counting() {
         use crate::sessions::codex::parse_codex_file_incremental;
         let identity = CacheIdentity::for_client(ClientId::Codex);
-        assert_eq!(identity.parser_version, 18);
+        assert_eq!(identity.parser_version, 19);
         let dir = TempDir::new().unwrap();
         let shard = dir.path().join("legacy.bin");
-        let source = dir.path().join("codex-v10-parser18.jsonl");
-        let bytes = include_bytes!("../tests/fixtures/billing-cache/codex-v10-parser18.bin");
+        let source = dir.path().join("codex-v10-parser19.jsonl");
+        // Produced by the unmodified upstream writer at `aed9e7e1` (parser 19)
+        // from the same transcript inputs and with byte-identical incremental
+        // state as the parser-18 producer set in `codex-parser18/`.
+        let bytes = include_bytes!("../tests/fixtures/billing-cache/codex-v10-parser19.bin");
         let prefix = include_str!("../tests/fixtures/billing-cache/codex-parser18/prefix.jsonl");
         let append_pending =
             include_str!("../tests/fixtures/billing-cache/codex-parser18/append-pending.jsonl");
@@ -4752,7 +4759,7 @@ mod tests {
         std::fs::write(&shard, bytes).unwrap();
         std::fs::write(&source, prefix).unwrap();
         let ShardReadStatus::Migrated(entries) = read_shard(&shard, identity) else {
-            panic!("upstream parser-18 v10 state must migrate without positional corruption");
+            panic!("upstream parser-19 v10 state must migrate without positional corruption");
         };
         assert_eq!(std::fs::read(&shard).unwrap(), bytes);
         assert_eq!(entries.len(), 1);
@@ -5018,15 +5025,67 @@ mod tests {
         );
     }
 
+    /// The remaining `claude-parser2` provenance files are consumed here: the
+    /// producer derived its frozen shard from `prefix + append == complete`,
+    /// and `expected-complete-messages.json` is the frozen producer's parse of
+    /// the complete transcript. A cold parse of those bytes must still match
+    /// it, modulo the billing fields this branch introduced.
+    #[test]
+    #[serial_test::serial]
+    fn claude_parser2_complete_transcript_matches_frozen_producer_output() {
+        let dir = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(dir.path());
+        let prefix = include_str!("../tests/fixtures/billing-cache/claude-parser2/prefix.jsonl");
+        let append = include_str!("../tests/fixtures/billing-cache/claude-parser2/append.jsonl");
+        let complete =
+            include_str!("../tests/fixtures/billing-cache/claude-parser2/complete.jsonl");
+        assert_eq!(
+            format!("{prefix}{append}"),
+            complete,
+            "a silent edit to one fixture file would detach the provenance set"
+        );
+        let source = dir
+            .path()
+            .join(".claude/projects/synthetic-project/claude-v12.jsonl");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, complete).unwrap();
+        let mut messages = crate::parse_all_messages_with_pricing_with_env_strategy(
+            dir.path().to_str().unwrap(),
+            &["claude".to_string()],
+            None,
+            false,
+            &crate::scanner::ScannerSettings {
+                bucket_timezone: Some("UTC".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut expected: Vec<UnifiedMessage> = serde_json::from_str(include_str!(
+            "../tests/fixtures/billing-cache/claude-parser2/expected-complete-messages.json"
+        ))
+        .unwrap();
+        // The frozen producer predates billing identity and pricing model
+        // preservation; everything else must match exactly.
+        for message in &mut messages {
+            message.billing_identity = crate::sessions::BillingIdentity::Unknown;
+            message.pricing_model_id = None;
+        }
+        expected.sort_by(|a, b| a.dedup_key.cmp(&b.dedup_key));
+        messages.sort_by(|a, b| a.dedup_key.cmp(&b.dedup_key));
+        assert_eq!(messages, expected);
+    }
+
     #[test]
     fn historical_codex_cache_is_stale_before_decoding_old_state() {
         let identity = CacheIdentity::for_client(ClientId::Codex);
-        assert_eq!(identity.parser_version, 18);
+        assert_eq!(identity.parser_version, 19);
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("old.bin");
         for bytes in [
             include_bytes!("../tests/fixtures/billing-cache/codex-v10-parser14.bin").as_slice(),
             include_bytes!("../tests/fixtures/billing-cache/codex-v10-parser15.bin").as_slice(),
+            // Parser 18 predates the OpenCodex combo-attribution bump, so its
+            // released shard is rejected by version before any payload decode.
+            include_bytes!("../tests/fixtures/billing-cache/codex-v10-parser18.bin").as_slice(),
         ] {
             std::fs::write(&path, bytes).unwrap();
             assert!(matches!(
@@ -6583,16 +6642,31 @@ mod tests {
             },
             0.99,
         );
-        let mut stale_cache = SourceMessageCache::default();
-        stale_cache.insert(CachedSourceEntry::new(
+        // Fabricate the shard exactly as a v3-era writer left it: a v3
+        // envelope holding v3 entries. Routing a stale-identity entry through
+        // the current save pipeline would instead write a current envelope
+        // with a mismatched entry, which shard validation rejects as corrupt.
+        let stale_entry = CachedSourceEntry::new(
             stale_identity,
             source.path(),
             fingerprint.clone(),
             vec![stale_message],
             Vec::new(),
             None,
-        ));
-        stale_cache.save_if_dirty();
+        );
+        let shard_root = cache_shard_dir().unwrap();
+        let stale_shard = shard_path(
+            &shard_root,
+            &CacheKey::new(stale_identity, source.path()).shard(),
+        );
+        std::fs::create_dir_all(stale_shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &stale_shard,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
 
         let mut current_cache = SourceMessageCache::load();
         assert!(
@@ -9182,12 +9256,14 @@ mod tests {
     /// Exact versions after this change, so a later edit cannot silently
     /// collide a member with the version it is replacing. The shared base
     /// moved 2 -> 3, so Roo/Kilo Code land on 3 and Cline keeps its own
-    /// offset; Kilo CLI moves by its own offset instead.
+    /// offset; Kilo CLI moves by its own offset instead. Cline's offset then
+    /// moved 3 -> 4 when its manifest-inherited billing evidence became
+    /// session-level, so it lands on 7.
     #[test]
     fn test_roo_kilo_family_parser_versions_after_cache_overlap_fix() {
         assert_eq!(parser_version(ClientId::RooCode), 3);
         assert_eq!(parser_version(ClientId::KiloCode), 3);
-        assert_eq!(parser_version(ClientId::Cline), 6);
+        assert_eq!(parser_version(ClientId::Cline), 7);
         assert_eq!(parser_version(ClientId::Kilo), 2);
     }
 
