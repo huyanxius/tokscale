@@ -503,3 +503,48 @@ fn claude_record_channel_outweighs_later_variant_metadata() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].billing_identity.id(), Some("record-a"));
 }
+
+#[test]
+fn roo_kilo_and_cline_pricing_preserves_reported_cost_and_estimates_net_input() {
+    use tokscale_core::sessions::{
+        cline::parse_cline_file, kilocode::parse_kilocode_file, roocode::parse_roocode_file,
+    };
+    let svc = service(json!({"provider_overrides":[{
+        "provider_id":"gateway-a", "model_id":"atlas",
+        "pricing":{"input_cost_per_million_tokens":10.,"output_cost_per_million_tokens":0.,
+            "cache_read_input_token_cost":0.,"cache_creation_input_token_cost":0.}
+    }]}));
+    for (parse, expected_input) in [
+        (parse_roocode_file as fn(&Path) -> Vec<UnifiedMessage>, 300),
+        (parse_kilocode_file as fn(&Path) -> Vec<UnifiedMessage>, 300),
+        (parse_cline_file as fn(&Path) -> Vec<UnifiedMessage>, 1000),
+    ] {
+        for cost in [0., 0.25] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("ui_messages.json");
+            std::fs::write(
+                &path,
+                json!([{
+                    "type":"say", "say":"api_req_started", "ts":1789022955199_i64,
+                    "modelInfo":{"modelId":"atlas","providerId":"gateway-a"},
+                    "text":json!({"cost":cost,"tokensIn":1000,"tokensOut":10,
+                        "cacheReads":600,"cacheWrites":100,"apiProtocol":"openai"}).to_string()
+                }])
+                .to_string(),
+            )
+            .unwrap();
+            let messages = parse(&path);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].tokens.input, expected_input);
+            assert_eq!(messages[0].billing_identity.id(), Some("gateway-a"));
+            let explained = svc.explain_message(&messages[0]);
+            let expected_cost = if cost > 0. {
+                cost
+            } else {
+                expected_input as f64 * 10. / 1_000_000.
+            };
+            assert!((explained.final_estimate - expected_cost).abs() < 1e-12);
+            assert_eq!(explained.scope == "reported", cost > 0.);
+        }
+    }
+}
