@@ -593,6 +593,55 @@
         "source": {}
       },
       "additionalProperties": true,
+      "propertyNames": {
+        "anyOf": [
+          {
+            "enum": [
+              "input_cost_per_million_tokens",
+              "input_cost_per_million_tokens_above_128k_tokens",
+              "input_cost_per_million_tokens_above_200k_tokens",
+              "input_cost_per_million_tokens_above_256k_tokens",
+              "input_cost_per_million_tokens_above_272k_tokens",
+              "input_cost_per_token",
+              "input_cost_per_token_above_128k_tokens",
+              "input_cost_per_token_above_200k_tokens",
+              "input_cost_per_token_above_256k_tokens",
+              "input_cost_per_token_above_272k_tokens",
+              "output_cost_per_million_tokens",
+              "output_cost_per_million_tokens_above_128k_tokens",
+              "output_cost_per_million_tokens_above_200k_tokens",
+              "output_cost_per_million_tokens_above_256k_tokens",
+              "output_cost_per_million_tokens_above_272k_tokens",
+              "output_cost_per_token",
+              "output_cost_per_token_above_128k_tokens",
+              "output_cost_per_token_above_200k_tokens",
+              "output_cost_per_token_above_256k_tokens",
+              "output_cost_per_token_above_272k_tokens",
+              "cache_creation_input_token_cost_per_million_tokens",
+              "cache_creation_input_token_cost_per_million_tokens_above_200k_tokens",
+              "cache_creation_input_token_cost",
+              "cache_creation_input_token_cost_above_200k_tokens",
+              "cache_creation_input_token_cost_per_million_tokens_above_1hr",
+              "cache_creation_input_token_cost_per_million_tokens_above_1hr_above_200k_tokens",
+              "cache_creation_input_token_cost_above_1hr",
+              "cache_creation_input_token_cost_above_1hr_above_200k_tokens",
+              "cache_read_input_token_cost_per_million_tokens",
+              "cache_read_input_token_cost_per_million_tokens_above_200k_tokens",
+              "cache_read_input_token_cost_per_million_tokens_above_272k_tokens",
+              "cache_read_input_token_cost",
+              "cache_read_input_token_cost_above_200k_tokens",
+              "cache_read_input_token_cost_above_272k_tokens",
+              "notes",
+              "source"
+            ]
+          },
+          {
+            "not": {
+              "pattern": "(^|_)([cC][oO][sS][tT]|[pP][rR][iI][cC][eE]|[pP][rR][iI][cC][iI][nN][gG]|[rR][aA][tT][eE][sS]?)($|_)"
+            }
+          }
+        ]
+      },
       "anyOf": [
         {
           "required": [

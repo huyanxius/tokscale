@@ -127,14 +127,29 @@ fn schema_matches_runtime_rate_validation() {
         assert_validation(global(pricing.clone()), false, 0);
         assert_validation(scoped(pricing), false, 0);
     }
-    // Legacy rows retain nullable/unknown optional fields; scoped rules are strict.
+    // Legacy rows retain nullable/unknown metadata; scoped rules are strict.
     for pricing in [
         json!({"input_cost_per_token": 0.0, "output_cost_per_token": null}),
         json!({"input_cost_per_token": 0.0, "cache_read_input_token_cost": null}),
         json!({"input_cost_per_token": 0.0, "old_metadata": "retained"}),
+        json!({"input_cost_per_token": 0.0, "max_tokens": 128_000}),
     ] {
         assert_validation(global(pricing.clone()), true, 1);
         assert_validation(scoped(pricing), false, 0);
+    }
+
+    // A misspelled rate cannot be treated as harmless legacy metadata: doing so
+    // would select the partial custom row and add partial money to local totals.
+    for field in [
+        "output_cost_per_million_toknes",
+        "custom_price",
+        "discount_rate",
+    ] {
+        assert_validation(
+            global(json!({"input_cost_per_million_tokens": 1.0, (field): 10.0})),
+            false,
+            0,
+        );
     }
 }
 

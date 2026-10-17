@@ -19,7 +19,7 @@ Only existing synthetic normalization is used in those four steps. As a backward
 
 ## Rates, zero and current estimates
 
-All custom prices are USD base rates, per token or per million tokens. Each dimension accepts one unit form, not both; values must be finite and nonnegative. New scoped rate objects reject null and unknown fields, while `notes` and `source` metadata are allowed and never fetched. Global legacy metadata stays compatible. All existing token buckets and threshold dimensions remain available.
+All custom prices are USD base rates, per token or per million tokens. Each dimension accepts one unit form, not both; values must be finite and nonnegative. New scoped rate objects reject null and unknown fields, while `notes` and `source` metadata are allowed and never fetched. Global legacy metadata stays compatible, but unknown global fields whose names look like rates (`cost`, `price`, `pricing`, or `rate`) are rejected so a misspelled rate cannot silently produce a partial estimate. All existing token buckets and threshold dimensions remain available.
 
 Zero is an explicit valid rate, distinct from no matching rule. Existing complete-free pricing policy remains unchanged. A provider-reported amount, including zero, always wins over estimates. Estimated history is recalculated using the current process's configuration and current loaded price tables; restarting after edits applies new rates. Paid → free → paid changes replace old estimates. Removed/missing prices cannot leave stale money in current totals. Partial estimates are marked incomplete; stale/unpriced amounts contribute zero and are not submission-safe. Coverage means supported token/rate evidence, not a verified bill.
 

@@ -918,11 +918,15 @@ fn parse_claude_lines(
                 if let Some(tool_message) = tool_result_message {
                     if let Some(ref dedup_key) = tool_message.dedup_key {
                         if let Some(&existing_idx) = processed_hashes.get(dedup_key) {
+                            let mut billing_conflicted = billing_conflicts.contains(&existing_idx);
                             merge_claude_tool_result_duplicate(
                                 &mut messages[existing_idx],
-                                tool_message.tokens.input,
-                                tool_message.timestamp,
+                                &tool_message,
+                                &mut billing_conflicted,
                             );
+                            if billing_conflicted {
+                                billing_conflicts.insert(existing_idx);
+                            }
                             continue;
                         }
                         processed_hashes.insert(dedup_key.clone(), messages.len());
@@ -1604,12 +1608,45 @@ pub(crate) fn merge_message_completeness(
 
 fn merge_claude_tool_result_duplicate(
     existing: &mut UnifiedMessage,
-    input_tokens: i64,
-    timestamp_ms: i64,
+    incoming: &UnifiedMessage,
+    billing_conflicted: &mut bool,
 ) {
-    existing.tokens.input = existing.tokens.input.max(input_tokens.max(0));
-    if timestamp_ms >= existing.timestamp {
-        existing.set_timestamp(timestamp_ms);
+    existing.tokens.input = existing.tokens.input.max(incoming.tokens.input.max(0));
+    if incoming.timestamp >= existing.timestamp {
+        existing.set_timestamp(incoming.timestamp);
+    }
+
+    let weaker_identity = matches!(
+        (&existing.billing_identity, &incoming.billing_identity),
+        (
+            super::BillingIdentity::Known {
+                origin: super::BillingIdentityOrigin::ExplicitRecord,
+                ..
+            },
+            super::BillingIdentity::Known {
+                origin: super::BillingIdentityOrigin::ExplicitSession,
+                ..
+            }
+        )
+    );
+    let conflicting_records = matches!(
+        (&existing.billing_identity, &incoming.billing_identity),
+        (
+            super::BillingIdentity::Known {
+                id: first,
+                origin: super::BillingIdentityOrigin::ExplicitRecord,
+            },
+            super::BillingIdentity::Known {
+                id: second,
+                origin: super::BillingIdentityOrigin::ExplicitRecord,
+            }
+        ) if first != second
+    );
+    if conflicting_records {
+        existing.billing_identity = super::BillingIdentity::Unknown;
+        *billing_conflicted = true;
+    } else if !weaker_identity && incoming.billing_identity.id().is_some() && !*billing_conflicted {
+        existing.billing_identity = incoming.billing_identity.clone();
     }
 }
 
@@ -1683,7 +1720,7 @@ fn extract_claude_tool_result_message(
             .as_ref()
             .and_then(|message| message.model.clone())
     });
-    let provider_hint = extract_claude_provider(&value)
+    let record_provider_hint = extract_claude_provider(&value)
         .or_else(|| {
             context
                 .entry
@@ -1723,9 +1760,15 @@ fn extract_claude_tool_result_message(
             None => "unknown".to_string(),
         },
     };
-    let provider_hint = provider_hint
+    let provider_hint = record_provider_hint
+        .clone()
         .or_else(|| context.last_provider_hint.map(str::to_string))
         .or_else(|| context.default_provider_hint.map(str::to_string));
+    let billing_origin = if record_provider_hint.is_some() {
+        super::BillingIdentityOrigin::ExplicitRecord
+    } else {
+        super::BillingIdentityOrigin::ExplicitSession
+    };
 
     let provider_choice = claude_provider_choice(&raw_model, provider_hint.as_deref());
     let model = canonicalize_claude_model(&raw_model);
@@ -1752,10 +1795,7 @@ fn extract_claude_tool_result_message(
             .dedup_key
             .map(|key| tool_result_dedup_key(context.client_id, context.session_id, &key)),
     )
-    .with_billing(
-        provider_hint.as_deref(),
-        super::BillingIdentityOrigin::ExplicitRecord,
-    )
+    .with_billing(provider_hint.as_deref(), billing_origin)
     .with_pricing_model(&raw_model);
     message.message_count = 0;
     message.agent = context.sidechain_agent;
@@ -2113,10 +2153,13 @@ fn extract_claude_headless_message(
         return None;
     }
     let provider_hint = extract_claude_provider(value);
-    let provider_id = claude_provider_id(
-        &raw_model,
-        provider_hint.as_deref().or(default_provider_hint),
-    );
+    let billing_provider = provider_hint.as_deref().or(default_provider_hint);
+    let billing_origin = if provider_hint.is_some() {
+        super::BillingIdentityOrigin::ExplicitRecord
+    } else {
+        super::BillingIdentityOrigin::ExplicitSession
+    };
+    let provider_id = claude_provider_id(&raw_model, billing_provider);
     let model = canonicalize_claude_model(&raw_model);
     let timestamp = extract_claude_timestamp(value).unwrap_or(fallback_timestamp);
 
@@ -2144,10 +2187,7 @@ fn extract_claude_headless_message(
             },
             0.0,
         )
-        .with_billing(
-            provider_hint.as_deref().or(default_provider_hint),
-            super::BillingIdentityOrigin::ExplicitRecord,
-        )
+        .with_billing(billing_provider, billing_origin)
         .with_pricing_model(&raw_model),
     )
 }
@@ -2353,10 +2393,13 @@ fn finalize_headless_state(
         *state = ClaudeHeadlessState::default();
         return None;
     }
-    let provider_id = claude_provider_id(
-        &raw_model,
-        state.provider_id.as_deref().or(default_provider_hint),
-    );
+    let billing_provider = state.provider_id.as_deref().or(default_provider_hint);
+    let billing_origin = if state.provider_id.is_some() {
+        super::BillingIdentityOrigin::ExplicitRecord
+    } else {
+        super::BillingIdentityOrigin::ExplicitSession
+    };
+    let provider_id = claude_provider_id(&raw_model, billing_provider);
     let model = canonicalize_claude_model(&raw_model);
     let timestamp = state.timestamp_ms.unwrap_or(fallback_timestamp);
     if state.input == 0 && state.output == 0 && state.cache_read == 0 && state.cache_write == 0 {
@@ -2380,10 +2423,7 @@ fn finalize_headless_state(
         },
         0.0,
     )
-    .with_billing(
-        state.provider_id.as_deref().or(default_provider_hint),
-        super::BillingIdentityOrigin::ExplicitRecord,
-    )
+    .with_billing(billing_provider, billing_origin)
     .with_pricing_model(&raw_model);
 
     *state = ClaudeHeadlessState::default();
@@ -3052,6 +3092,41 @@ mod tests {
         assert_eq!(messages[0].model_id, "sonnet");
         assert_eq!(messages[0].tokens.input, 7);
         assert_eq!(messages[0].message_count, 0);
+        assert_eq!(
+            messages[0].billing_identity,
+            crate::sessions::BillingIdentity::Known {
+                id: "zai".into(),
+                origin: crate::sessions::BillingIdentityOrigin::ExplicitSession,
+            }
+        );
+    }
+
+    #[test]
+    fn tool_result_duplicate_prefers_record_billing_in_both_orders() {
+        let session = r#"{"type":"user","timestamp":"2026-05-27T10:00:00.000Z","message":{"model":"sonnet","content":[{"type":"tool_result","tool_use_id":"toolu_billing","tool_output":{"input_tokens":4}}]}}"#;
+        let record = r#"{"type":"user","timestamp":"2026-05-27T10:00:00.100Z","message":{"model":"sonnet","providerId":"vertex","content":[{"type":"tool_result","tool_use_id":"toolu_billing","tool_output":{"input_tokens":8}}]}}"#;
+        for content in [
+            format!("{session}\n{record}"),
+            format!("{record}\n{session}"),
+        ] {
+            let (_temp_dir, path) = create_cc_mirror_project_file(
+                &content,
+                "zai-worker",
+                "zai",
+                "project-one",
+                "session.jsonl",
+            );
+            let messages = parse_claude_file(&path);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].tokens.input, 8);
+            assert_eq!(
+                messages[0].billing_identity,
+                crate::sessions::BillingIdentity::Known {
+                    id: "vertex".into(),
+                    origin: crate::sessions::BillingIdentityOrigin::ExplicitRecord,
+                }
+            );
+        }
     }
 
     #[test]

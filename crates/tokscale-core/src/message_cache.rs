@@ -1542,7 +1542,9 @@ const SHARED_PARSER_FAMILIES: &[SharedParserFamily] = &[
             // reparsed.
             // v4->v5: clamp CLI input after signed cache subtraction so warm
             // sources cannot replay negative tokens into submission totals.
-            (ClientId::Cline, 3),
+            // v5->v6: billing evidence inherited from the CLI session manifest
+            // is labelled session-level instead of record-level.
+            (ClientId::Cline, 4),
         ],
     },
     SharedParserFamily {
@@ -1659,7 +1661,10 @@ fn parser_version(client: ClientId) -> u32 {
         // must not survive the new path classification.
         // v6->v7: SQLite rows with NULL event_json hold zstd payloads. Older
         // scans cached only the plain rows, even when the store never changed.
-        ClientId::OpenClaw => 7,
+        // v7->v8: mutable session-window routing remains attribution-only;
+        // transcript events now carry billing identity only from time-bound
+        // message/model-change evidence.
+        ClientId::OpenClaw => 8,
         // These clients accumulated parser-only invalidations under the old
         // global schema. Their independent counters start from those histories
         // so future changes have an obvious local version to increment.
@@ -1902,7 +1907,9 @@ fn parser_version(client: ClientId) -> u32 {
         // `step/start` clock of its `(turn, step)` and carries `duration_ms`.
         // Transcripts are append-only, so every cached row predates that field
         // and would keep the client reporting zero throughput until reparsed.
-        ClientId::Dsh => 8,
+        // v8->v9: request-header fallback billing evidence is labelled
+        // session-level while per-message source evidence remains record-level.
+        ClientId::Dsh => 9,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
@@ -2039,7 +2046,9 @@ struct CacheShardKey {
 /// rather than evicting the whole source cache with a parser-version bump.
 /// Generation 3 synchronizes advisor billing identities with their final parent.
 /// No generation marker is a real message index; the serialized layout is unchanged.
-const CLAUDE_RETAINED_PARSE_GENERATION: u32 = 3;
+// Generation 4 preserves record-over-session billing evidence when streamed
+// tool-result duplicates arrive in either order.
+const CLAUDE_RETAINED_PARSE_GENERATION: u32 = 4;
 const CLAUDE_RETENTION_PROVENANCE_MARKER: usize =
     usize::MAX - (CLAUDE_RETAINED_PARSE_GENERATION as usize - 1);
 
@@ -3033,6 +3042,29 @@ impl CachedSourceEntry {
         changed
     }
 
+    /// A generation older than the record-over-session tool-result merge can
+    /// contain an order-dependent scoped billing label. A live source takes the
+    /// normal retention-preserving rebuild path. If the source disappeared, the
+    /// cache is the only history left, so preserve every row but clear only the
+    /// affected scoped identity before repricing it.
+    fn remove_legacy_claude_tool_result_billing(&mut self) -> bool {
+        if !self.needs_retention_provenance_migration() {
+            return false;
+        }
+        let mut changed = false;
+        for message in &mut self.messages {
+            let is_tool_result = message
+                .dedup_key
+                .as_deref()
+                .is_some_and(|key| !crate::sessions::claudecode::dedup_key_is_globally_stable(key));
+            if is_tool_result && message.billing_identity.id().is_some() {
+                message.billing_identity = crate::sessions::BillingIdentity::Unknown;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Carry forward keyed messages an entry already on disk holds for this
     /// same path and this one does not.
     ///
@@ -3352,6 +3384,7 @@ impl SourceMessageCache {
                     state.dirty = true;
                     continue;
                 }
+                let repaired_billing = entry.remove_legacy_claude_tool_result_billing();
                 // Only retained Claude history can outlive a missing source;
                 // an ordinary deleted session must stop contributing usage.
                 if !key.path.to_path_buf().exists() && !entry.holds_retained_history() {
@@ -3367,11 +3400,12 @@ impl SourceMessageCache {
                 {
                     continue;
                 }
-                if entry.remove_claude_synthetic_placeholders() {
+                let repaired_placeholders = entry.remove_claude_synthetic_placeholders();
+                if repaired_billing || repaired_placeholders {
                     // Do not bump Claude's parser version here: compacted
                     // transcripts rely on cached assistant history that a
-                    // full invalidation cannot recover. Repair only the bad
-                    // `<synthetic>` rows and persist that narrow migration.
+                    // full invalidation cannot recover. Persist only the safe
+                    // in-place repairs; live sources still rebuild normally.
                     state.dirty_keys.insert(key.clone());
                     state.dirty = true;
                 }
@@ -3819,6 +3853,68 @@ fn migrated_shard(mut entries: Vec<CachedSourceEntry>) -> ShardReadStatus {
 }
 
 fn read_shard_with_limit(
+    path: &Path,
+    identity: CacheIdentity,
+    max_shard_bytes: u64,
+) -> ShardReadStatus {
+    validate_shard_entries(
+        read_shard_with_limit_unchecked(path, identity, max_shard_bytes),
+        identity,
+        path,
+    )
+}
+
+fn validate_shard_entries(
+    status: ShardReadStatus,
+    identity: CacheIdentity,
+    path: &Path,
+) -> ShardReadStatus {
+    let (entries, migrated) = match status {
+        ShardReadStatus::Loaded(entries) => (entries, false),
+        ShardReadStatus::Migrated(entries) => (entries, true),
+        status => return status,
+    };
+    let mut keys = HashSet::with_capacity(entries.len());
+    let shard_index = path.file_name().and_then(parse_shard_filename);
+    for entry in &entries {
+        if !entry.matches_identity(identity) {
+            return ShardReadStatus::Invalid(format!(
+                "cache entry identity does not match its {} envelope",
+                identity.namespace
+            ));
+        }
+        let key = CacheKey::from_entry(entry);
+        if shard_index.is_some_and(|index| key.shard().index != index) {
+            return ShardReadStatus::Invalid(format!(
+                "cache entry for {} is stored in the wrong shard",
+                entry.path.to_path_buf().display()
+            ));
+        }
+        if !keys.insert(key) {
+            return ShardReadStatus::Invalid(format!(
+                "duplicate cache entry for {}",
+                entry.path.to_path_buf().display()
+            ));
+        }
+        if entry.is_claude_namespace()
+            && entry.fallback_timestamp_indices.iter().any(|index| {
+                *index >= entry.messages.len() && *index < CLAUDE_RETENTION_PROVENANCE_MARKER
+            })
+        {
+            return ShardReadStatus::Invalid(format!(
+                "Claude retained-history index is out of bounds for {}",
+                entry.path.to_path_buf().display()
+            ));
+        }
+    }
+    if migrated {
+        ShardReadStatus::Migrated(entries)
+    } else {
+        ShardReadStatus::Loaded(entries)
+    }
+}
+
+fn read_shard_with_limit_unchecked(
     path: &Path,
     identity: CacheIdentity,
     max_shard_bytes: u64,
@@ -6200,7 +6296,7 @@ mod tests {
     /// v7 retires SQLite scans that omitted compressed transcript rows.
     #[test]
     fn test_openclaw_parser_version_invalidates_v6_entries() {
-        assert_eq!(parser_version(ClientId::OpenClaw), 7);
+        assert_eq!(parser_version(ClientId::OpenClaw), 8);
     }
 
     #[test]
@@ -6973,7 +7069,7 @@ mod tests {
         cache.save_if_dirty();
         let warm = SourceMessageCache::load();
         let cached = warm.get(identity, &source).unwrap();
-        assert_eq!(cached.parser_version, 7);
+        assert_eq!(cached.parser_version, 8);
         assert_eq!(cached.messages, parsed);
     }
 
@@ -7113,7 +7209,7 @@ mod tests {
         // DSH transcript files are append-only, so v6 cache entries keep the
         // old cross-session attempt keys unless the source is reparsed. The
         // v7->v8 bump retires rows parsed without generation durations.
-        assert_eq!(parser_version(ClientId::Dsh), 8);
+        assert_eq!(parser_version(ClientId::Dsh), 9);
     }
 
     /// Names the row that only a served cache can put in a report. No DSH
@@ -7382,7 +7478,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 8);
+        assert_eq!(current_identity.parser_version, 9);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
             parser_version: 7,
@@ -7435,7 +7531,7 @@ mod tests {
         let cached = persisted
             .get(current_identity, &source)
             .expect("the scan must persist the entry it reparsed");
-        assert_eq!(cached.parser_version, 8);
+        assert_eq!(cached.parser_version, 9);
         assert_eq!(cached.messages.len(), 1);
         assert_eq!(cached.messages[0].timestamp, 1786669450000);
         assert_eq!(cached.messages[0].duration_ms, Some(1_200));
@@ -7458,7 +7554,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 8);
+        assert_eq!(current_identity.parser_version, 9);
         // Pinned at 3, the identity 4.14.0 cached under, rather than derived
         // from the running version: this is the row that release left on disk.
         let stale_identity = CacheIdentity {
@@ -7519,7 +7615,7 @@ mod tests {
         let cached = persisted
             .get(current_identity, &source)
             .expect("the scan must persist the entry it reparsed");
-        assert_eq!(cached.parser_version, 8);
+        assert_eq!(cached.parser_version, 9);
         assert_eq!(cached.messages.len(), 1);
         assert_eq!(cached.messages[0].model_id, "glm-5.3");
 
@@ -7546,7 +7642,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 8);
+        assert_eq!(current_identity.parser_version, 9);
         // Pinned at 4, the identity 4.15.0 cached under; see the v3 test.
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
@@ -7606,7 +7702,7 @@ mod tests {
         let cached = persisted
             .get(current_identity, &source)
             .expect("the scan must persist the entry it reparsed");
-        assert_eq!(cached.parser_version, 8);
+        assert_eq!(cached.parser_version, 9);
         assert_eq!(cached.messages, scanned);
 
         let warm = scan_dsh(source_home.path());
@@ -8004,7 +8100,7 @@ mod tests {
                 &[
                     (ClientId::RooCode, 0),
                     (ClientId::KiloCode, 0),
-                    (ClientId::Cline, 3),
+                    (ClientId::Cline, 4),
                 ],
             ),
             (
@@ -12031,6 +12127,58 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn missing_generation_three_claude_history_clears_only_tool_result_billing() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let source = write_temp_file(b"synthetic Claude source");
+        let path = source.path().to_path_buf();
+        let mut tool = keyed_message(
+            "claude",
+            "session",
+            "claude:tool_result:session:tool_result:toolu_billing",
+        );
+        tool.billing_identity = crate::sessions::BillingIdentity::Known {
+            id: "stale-session-route".into(),
+            origin: crate::sessions::BillingIdentityOrigin::ExplicitSession,
+        };
+        let mut retained = keyed_message("claude", "session", "retained:req");
+        retained.billing_identity = crate::sessions::BillingIdentity::Known {
+            id: "record-route".into(),
+            origin: crate::sessions::BillingIdentityOrigin::ExplicitRecord,
+        };
+        let mut entry = entry_with_messages(identity, &path, vec![tool, retained]);
+        entry.fallback_timestamp_indices = vec![1, usize::MAX - 2];
+        let mut cache = SourceMessageCache::load();
+        cache.insert(entry);
+        cache.save_if_dirty();
+        drop(source);
+
+        let mut cache = SourceMessageCache::load();
+        let repaired = cache
+            .get(identity, &path)
+            .expect("retained history remains available without its source");
+        assert_eq!(repaired.messages.len(), 2);
+        assert_eq!(
+            repaired.messages[0].billing_identity,
+            crate::sessions::BillingIdentity::Unknown
+        );
+        assert_eq!(
+            repaired.messages[1].billing_identity,
+            crate::sessions::BillingIdentity::Known {
+                id: "record-route".into(),
+                origin: crate::sessions::BillingIdentityOrigin::ExplicitRecord,
+            }
+        );
+        cache.save_if_dirty();
+        let warm = SourceMessageCache::load()
+            .get(identity, &path)
+            .expect("sanitized retained history must survive the rewrite");
+        assert_eq!(warm.messages, repaired.messages);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn missing_claude_sources_without_retained_history_are_pruned() {
         let home = TempDir::new().unwrap();
         let _env = sandbox_cache_env(home.path());
@@ -12072,6 +12220,93 @@ mod tests {
         assert!(cache.get(identity, source.path()).is_none());
         cache.insert(test_entry(identity, source.path(), "newly-parsed"));
         cache.save_if_dirty();
+        assert_eq!(std::fs::read(shard).unwrap(), original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn malformed_claude_retention_index_never_overwrites_original_bytes() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        let source = write_temp_file(b"synthetic source");
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let mut entry = entry_with_messages(
+            identity,
+            source.path(),
+            vec![
+                keyed_message("claude", "session", "live:req"),
+                keyed_message("claude", "session", "retained:req"),
+            ],
+        );
+        entry.fallback_timestamp_indices =
+            vec![entry.messages.len(), CLAUDE_RETENTION_PROVENANCE_MARKER];
+        let shard = cache_shard_path(identity, source.path());
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(&shard, identity, &[entry], MAX_CACHE_SHARD_BYTES).unwrap();
+        let original = std::fs::read(&shard).unwrap();
+        match read_shard(&shard, identity) {
+            ShardReadStatus::Invalid(error) => {
+                assert!(error.contains("retained-history index is out of bounds"));
+            }
+            _ => panic!("semantic corruption must be visible as an invalid shard"),
+        }
+        let path = source.path().to_path_buf();
+        drop(source);
+
+        let mut cache = SourceMessageCache::load();
+        assert!(cache.get(identity, &path).is_none());
+        std::fs::write(&path, b"recreated source").unwrap();
+        cache.insert(test_entry(identity, &path, "newly-parsed"));
+        cache.save_if_dirty();
+        assert_eq!(std::fs::read(&shard).unwrap(), original);
+
+        drop(cache);
+        let mut retry = SourceMessageCache::load();
+        assert!(retry.get(identity, &path).is_none());
+        retry.insert(test_entry(identity, &path, "second-process-retry"));
+        retry.save_if_dirty();
+        assert_eq!(std::fs::read(shard).unwrap(), original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn duplicate_cache_keys_never_overwrite_original_shard_bytes() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        let source = write_temp_file(b"synthetic source");
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let first = entry_with_messages(
+            identity,
+            source.path(),
+            vec![keyed_message("claude", "session", "first:req")],
+        );
+        let second = entry_with_messages(
+            identity,
+            source.path(),
+            vec![keyed_message("claude", "session", "second:req")],
+        );
+        let shard = cache_shard_path(identity, source.path());
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(&shard, identity, &[first, second], MAX_CACHE_SHARD_BYTES).unwrap();
+        let original = std::fs::read(&shard).unwrap();
+        match read_shard(&shard, identity) {
+            ShardReadStatus::Invalid(error) => {
+                assert!(error.contains("duplicate cache entry"));
+            }
+            _ => panic!("duplicate cache keys must be visible as an invalid shard"),
+        }
+
+        let mut cache = SourceMessageCache::load();
+        assert!(cache.get(identity, source.path()).is_none());
+        cache.insert(test_entry(identity, source.path(), "newly-parsed"));
+        cache.save_if_dirty();
+        assert_eq!(std::fs::read(&shard).unwrap(), original);
+
+        drop(cache);
+        let mut retry = SourceMessageCache::load();
+        assert!(retry.get(identity, source.path()).is_none());
+        retry.insert(test_entry(identity, source.path(), "second-process-retry"));
+        retry.save_if_dirty();
         assert_eq!(std::fs::read(shard).unwrap(), original);
     }
 }

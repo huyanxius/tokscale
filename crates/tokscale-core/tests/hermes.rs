@@ -1088,6 +1088,20 @@ fn test_parse_hermes_sqlite_keeps_billing_providers_separate_for_same_model() {
     assert_eq!(kilocode.tokens.input, 1000);
     assert_eq!(opencode.tokens.input, 2000);
     assert_eq!(
+        kilocode.billing_identity,
+        tokscale_core::sessions::BillingIdentity::Known {
+            id: "kilocode".into(),
+            origin: tokscale_core::sessions::BillingIdentityOrigin::ExplicitRecord,
+        }
+    );
+    assert_eq!(
+        opencode.billing_identity,
+        tokscale_core::sessions::BillingIdentity::Known {
+            id: "opencode-zen".into(),
+            origin: tokscale_core::sessions::BillingIdentityOrigin::ExplicitRecord,
+        }
+    );
+    assert_eq!(
         kilocode.dedup_key.as_deref(),
         Some("hermes:session-split:glm-5.2:kilocode")
     );

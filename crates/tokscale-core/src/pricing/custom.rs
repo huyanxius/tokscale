@@ -85,6 +85,8 @@ struct CustomModelPricing {
     cache_read_input_token_cost: Option<f64>,
     cache_read_input_token_cost_above_200k_tokens: Option<f64>,
     cache_read_input_token_cost_above_272k_tokens: Option<f64>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
 }
 
 const CUSTOM_RATE_FIELDS: &[&str] = &[
@@ -125,6 +127,23 @@ const CUSTOM_RATE_FIELDS: &[&str] = &[
 ];
 
 impl CustomModelPricing {
+    fn suspicious_unknown_rate_field(&self) -> Option<&str> {
+        self.extra
+            .keys()
+            .filter(|field| {
+                field
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|part| {
+                        matches!(
+                            part.to_ascii_lowercase().as_str(),
+                            "cost" | "price" | "pricing" | "rate" | "rates"
+                        )
+                    })
+            })
+            .map(String::as_str)
+            .min()
+    }
+
     fn into_model_pricing(self) -> Result<ModelPricing, String> {
         let input_cost_per_token = base_price(
             self.input_cost_per_million_tokens,
@@ -430,6 +449,15 @@ impl CustomPricing {
                     continue;
                 }
             };
+            if let Some(field) = entry.suspicious_unknown_rate_field() {
+                result.error(
+                    path,
+                    &format!("$.models.{model_id}.{field}"),
+                    "unknown_rate_field",
+                    "unknown field looks like pricing and would otherwise be ignored".into(),
+                );
+                continue;
+            }
             let pricing = match entry.into_model_pricing() {
                 Ok(pricing) => pricing,
                 Err(err) => {

@@ -733,7 +733,11 @@ impl PricingService {
         })
     }
 
-    pub fn resolve_for_usage_with_provider(
+    /// Resolve the exact pricing evidence used to judge this usage for a
+    /// leaderboard submission. Callers that explain a rejection must inspect
+    /// this selected row rather than a plain lookup.
+    #[cfg(test)]
+    pub(crate) fn resolve_for_usage_with_provider(
         &self,
         model_id: &str,
         provider_id: Option<&str>,
