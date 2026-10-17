@@ -48,6 +48,7 @@ fn billing_identity_is_opaque_and_unknown_never_scoped() {
             billing_provider: provider,
             upstream_hint: Some("anthropic"),
             service_tier: None,
+            multi_call_aggregate: false,
         };
         let estimate = svc.estimate_context(&context, &usage());
         assert_eq!(estimate.cost, cost, "{provider:?}");
@@ -181,6 +182,7 @@ fn gateway_billing_does_not_change_fast_tier_or_borrow_another_scope() {
         billing_provider: Some("private-gateway"),
         upstream_hint: Some("openai"),
         service_tier: None,
+        multi_call_aggregate: false,
     };
     assert_eq!(svc.estimate_context(&context, &usage()).cost, 2.);
     context.service_tier = Some("priority");
@@ -249,6 +251,7 @@ fn parser_alias_compatibility_only_falls_back_to_old_global_rules() {
         billing_provider: Some("gateway"),
         upstream_hint: Some("zai"),
         service_tier: None,
+        multi_call_aggregate: false,
     };
     let selected = svc.lookup_context(&context, Some("custom")).unwrap();
     assert_eq!(selected.matched_provider_id, None);

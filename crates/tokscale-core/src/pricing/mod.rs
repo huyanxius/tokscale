@@ -704,6 +704,23 @@ impl PricingService {
         (estimate.cost, estimate.source(usage))
     }
 
+    /// Like [`Self::calculate_cost_detailed_with_provider`], for a usage row
+    /// known to combine more than one model request: per-request full-request
+    /// tiers are not applied to the aggregate.
+    pub fn calculate_cost_detailed_for_multi_call_aggregate(
+        &self,
+        model_id: &str,
+        provider_id: Option<&str>,
+        usage: &TokenBreakdown,
+    ) -> (f64, Option<crate::EstimateSource>) {
+        let context = PricingContext {
+            multi_call_aggregate: true,
+            ..PricingContext::explicit(model_id, provider_id)
+        };
+        let estimate = self.estimate_context(&context, usage);
+        (estimate.cost, estimate.source(usage))
+    }
+
     pub fn calculate_cost_with_provider(
         &self,
         model_id: &str,
@@ -790,6 +807,8 @@ impl PricingService {
                 usage.cache_write_1h,
                 usage.reasoning,
             )
+        } else if context.multi_call_aggregate {
+            lookup::compute_cost_for_multi_call_aggregate(&selected, context.upstream_hint, usage)
         } else {
             lookup::compute_cost_for_lookup(&selected, context.upstream_hint, usage)
         };
@@ -3441,6 +3460,11 @@ pub struct PricingContext<'a> {
     pub billing_provider: Option<&'a str>,
     pub upstream_hint: Option<&'a str>,
     pub service_tier: Option<&'a str>,
+    /// The usage row sums more than one model request. Full-request tiers
+    /// (xAI 200K, OpenAI 272K, Haiku 5.5 100K) are selected per request, so
+    /// an aggregate prices at the base rates; the service-tier multiplier
+    /// still applies.
+    pub multi_call_aggregate: bool,
 }
 
 impl<'a> PricingContext<'a> {
@@ -3451,6 +3475,7 @@ impl<'a> PricingContext<'a> {
             billing_provider: provider,
             upstream_hint: provider,
             service_tier: None,
+            multi_call_aggregate: false,
         }
     }
 
