@@ -1033,11 +1033,11 @@ fn parse_pi_format_file_inner(
             agent.clone(),
         )
         .with_billing(
-            // A billed operation carries no assistant message, so it supplies
-            // no record-level billing evidence and stays Unknown.
-            message
-                .and_then(|message| message.provider.as_deref())
-                .filter(|provider| accepts_replacement_field(provider, options.lossy_line_reader)),
+            // Record-level evidence only: a reply or tool result names its
+            // provider on the message, a standalone operation at the root.
+            // Legacy model-less usage rows inherit the session selection for
+            // attribution but supply no billing evidence.
+            clean_recorded_provider,
             super::BillingIdentityOrigin::ExplicitRecord,
         );
         if reported_cost.is_some() {
